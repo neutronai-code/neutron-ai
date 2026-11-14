@@ -1,0 +1,9 @@
+[project]
+name = "neutron-ai"
+version = "0.9.0"
+description = "NeutronAI — Execution-verified RLVR coding lab (Hadron & Quark model families)"
+requires-python = ">=3.12,<3.14"
+dependencies = []
+
+[project.optional-dependencies]
+train = ["unsloth", "vllm", "trl", "datasets"]
