@@ -69,6 +69,8 @@ def build_self_destruct_script(
         "}\n"
         "trap cleanup EXIT\n\n"
         "export DEBIAN_FRONTEND=noninteractive\n"
+        "apt-get update -qq && apt-get install -y -qq git build-essential g++ sqlite3 curl ca-certificates\n"
+        "curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && apt-get install -y -qq nodejs\n"
         "curl -LsSf https://astral.sh/uv/install.sh | sh\n"
         'export PATH="$HOME/.local/bin:$PATH"\n\n'
         "mkdir -p /workspace && cd /workspace\n"
@@ -80,14 +82,29 @@ def build_self_destruct_script(
 
 
 def cmd_plans(api_key: str):
-    body = _vultr_req("GET", "/plans?type=vcg", api_key)
-    plans = body.get("plans", [])
-    print(f"{'PLAN ID':32s} | {'VRAM':6s} | {'$/HR':7s} | {'$/MO':8s} | REGIONS")
-    print("-" * 88)
-    for p in sorted(plans, key=lambda x: float(x.get("hourly_cost", 999))):
-        locs = ",".join(p.get("locations", [])[:6])
-        vram = f"{p.get('gpu_vram_gb', '?')}GB"
-        print(f"{p['id']:32s} | {vram:6s} | ${float(p.get('hourly_cost', 0)):<6.3f} | ${float(p.get('monthly_cost', 0)):<7.1f} | {locs}")
+    # Query ALL Vultr plans + filter to any GPU plan (`vcg-*`, `vgpu`, or GPU VRAM > 0) + bare-metal GPUs (`vbm-*`)!
+    all_plans = _vultr_req("GET", "/plans?per_page=500", api_key).get("plans", [])
+    gpu_plans = [
+        p for p in all_plans
+        if p.get("id", "").startswith("vcg") or p.get("gpu_vram_gb") or p.get("gpu_type")
+    ]
+    try:
+        bm_plans = _vultr_req("GET", "/plans-metal", api_key).get("plans_metal", [])
+        for bp in bm_plans:
+            if bp.get("gpu_vram_gb") or bp.get("gpu_type") or "gpu" in str(bp).lower() or any(k in bp.get("id", "") for k in ("a100", "h100", "l40", "gh200", "mi300", "a40")):
+                gpu_plans.append({**bp, "_bare_metal": True})
+    except Exception:
+        pass
+
+    print(f"{'PLAN ID':36s} | {'TYPE':5s} | {'VRAM':6s} | {'$/HR':7s} | IN-STOCK REGIONS")
+    print("-" * 96)
+    for p in sorted(gpu_plans, key=lambda x: float(x.get("hourly_cost", 999))):
+        pid = p["id"]
+        locs_list = p.get("locations") or []
+        locs = ",".join(locs_list[:8]) if locs_list else "(sold out / account-locked)"
+        vram = f"{p.get('gpu_vram_gb') or p.get('vram') or '?'}GB"
+        kind = "METAL" if p.get("_bare_metal") else "VM"
+        print(f"{pid:36s} | {kind:5s} | {vram:6s} | ${float(p.get('hourly_cost', 0)):<6.3f} | {locs}")
 
 
 def cmd_launch(args) -> dict:
