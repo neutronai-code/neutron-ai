@@ -18,7 +18,7 @@ Usage:
   uv run vultr.py script --hf-repo NeutronAI/Hadron-7B-v0.9 --steps 300 --max-minutes 60
   $env:VULTR_API_KEY="..."; $env:HF_TOKEN="..."; uv run vultr.py launch --plan vcg-a100-1c-6g-16vram --region ewr --hf-repo NeutronAI/Hadron-7B-v0.9 --dry-run
 """
-import argparse, base64, json, os, urllib.request
+import argparse, base64, json, os, urllib.error, urllib.request
 
 VULTR_API = "https://api.vultr.com/v2"
 
@@ -33,9 +33,13 @@ def _vultr_req(method: str, path: str, api_key: str, payload: dict | None = None
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         method=method,
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read().decode("utf-8")
-        return json.loads(raw) if raw.strip() else {}
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Vultr API HTTP {e.code} on {method} {path}: {detail}") from None
 
 
 def build_self_destruct_script(
@@ -47,7 +51,18 @@ def build_self_destruct_script(
     hf_repo: str,
     auto_destroy: bool = True,
 ) -> str:
-    """Bash startup script with `trap cleanup EXIT` that destroys its own Vultr VM even if Python crashes."""
+    """Bash startup script with `trap cleanup EXIT` that uploads run logs & destroys its own Vultr VM even on crash."""
+    log_upload_block = (
+        f'  if [ -n "${{HF_TOKEN:-}}" ] && [ -f /var/log/neutron-train.log ]; then\n'
+        f'    python3 -c "import os, urllib.request; '\
+        f"t=os.environ['HF_TOKEN']; "\
+        f"urllib.request.urlopen(urllib.request.Request('https://huggingface.co/api/repos/create', data=b'{{\\\"name\\\":\\\"{hf_repo.split('/')[-1]}\\\"' + (b',\\\"organization\\\":\\\"{hf_repo.split('/')[0]}\\\"' if '/' in '{hf_repo}' else b'') + b'}}', headers={{'Authorization':f'Bearer {{t}}','Content-Type':'application/json'}}))"
+        f'" >/dev/null 2>&1 || true\n'
+        f'    "$HOME/.local/bin/uvx" --from huggingface_hub hf upload "{hf_repo}" /var/log/neutron-train.log neutron-train.log --token "$HF_TOKEN" >/dev/null 2>&1 || true\n'
+        f"  fi\n"
+        if hf_repo
+        else ""
+    )
     destroy_block = (
         '  if [ -n "${VULTR_API_KEY:-}" ] && [ -n "${VULTR_INSTANCE_ID:-}" ]; then\n'
         '    echo "[NeutronAI] Triggering Vultr API self-destruct for instance ${VULTR_INSTANCE_ID}..."\n'
@@ -60,19 +75,29 @@ def build_self_destruct_script(
     hf_flag = f'--push-hf "{hf_repo}"' if hf_repo else ""
     return (
         "#!/usr/bin/env bash\n"
-        "set -euo pipefail\n\n"
+        "exec > >(tee -a /var/log/neutron-train.log) 2>&1\n"
+        "set -euo pipefail\n"
+        'export HOME="${HOME:-/root}"\n'
+        "export DEBIAN_FRONTEND=noninteractive\n\n"
         "# Discover own Vultr instance-id via Vultr metadata service (169.254.169.254)\n"
-        'VULTR_INSTANCE_ID="$(curl -sf http://169.254.169.254/v1/instance-v2-id || true)"\n\n'
+        'VULTR_INSTANCE_ID="$(curl -sf http://169.254.169.254/v1/instance-v2-id || curl -sf http://169.254.169.254/v1.json | python3 -c \'import sys,json; print(json.load(sys.stdin).get(\"instance-v2-id\",\"\"))\' || true)"\n\n'
         "cleanup() {\n"
-        '  echo "[NeutronAI] Job exiting (code=$?). Running billing safeguard..."\n'
+        '  echo "[NeutronAI] Job exiting (code=$?). Uploading log & running billing safeguard..."\n'
+        f"{log_upload_block}"
         f"{destroy_block}"
         "}\n"
         "trap cleanup EXIT\n\n"
-        "export DEBIAN_FRONTEND=noninteractive\n"
-        "apt-get update -qq && apt-get install -y -qq git build-essential g++ sqlite3 curl ca-certificates\n"
-        "curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && apt-get install -y -qq nodejs\n"
+        "apt-get -o DPkg::Lock::Timeout=180 update -qq\n"
+        "apt-get -o DPkg::Lock::Timeout=180 install -y -qq git build-essential g++ sqlite3 curl ca-certificates python3\n"
+        "if ! command -v nvidia-smi >/dev/null 2>&1; then\n"
+        '  echo "[NeutronAI] Installing NVIDIA headless server driver..."\n'
+        "  apt-get -o DPkg::Lock::Timeout=180 install -y -qq ubuntu-drivers-common && ubuntu-drivers install --gpgpu || true\n"
+        "fi\n"
+        "curl -fsSL https://deb.nodesource.com/setup_24.x | bash -\n"
+        "apt-get -o DPkg::Lock::Timeout=180 install -y -qq nodejs\n"
         "curl -LsSf https://astral.sh/uv/install.sh | sh\n"
         'export PATH="$HOME/.local/bin:$PATH"\n\n'
+        "nvidia-smi\n"
         "mkdir -p /workspace && cd /workspace\n"
         f'if [ -n "{repo_url}" ]; then git clone "{repo_url}" neutron-ai && cd neutron-ai; fi\n\n'
         "uv sync --extra train\n"
@@ -126,11 +151,14 @@ def cmd_launch(args) -> dict:
     payload = {
         "region": args.region,
         "plan": args.plan,
-        "os_id": args.os_id,  # 2284 = Ubuntu 24.04 LTS x64 on Vultr
         "label": args.label,
         "hostname": "neutron-trainer",
         "user_data": base64.b64encode(full_script.encode("utf-8")).decode("ascii"),
     }
+    if args.image_id:
+        payload["image_id"] = args.image_id
+    else:
+        payload["os_id"] = args.os_id  # 2284 = Ubuntu 24.04 LTS x64 on Vultr
     if not args.confirm:
         print("[DRY-RUN] Pass `--confirm` to actually provision & bill Vultr. Payload preview:")
         preview = {**payload, "user_data": f"<base64 {len(payload['user_data'])} chars with trap EXIT DELETE safeguard>"}
@@ -167,6 +195,7 @@ if __name__ == "__main__":
     ap.add_argument("--plan", default="vcg-a100-1c-6g-16vram")
     ap.add_argument("--region", default="ewr")
     ap.add_argument("--os-id", type=int, default=2284, help="Vultr OS ID (2284 = Ubuntu 24.04 x64)")
+    ap.add_argument("--image-id", default="mldev", help="Vultr GPU Marketplace image_id (`mldev` = pre-installed NVIDIA CUDA/ML stack; pass '' for bare OS)")
     ap.add_argument("--label", default="neutron-hadron-rlvr")
     ap.add_argument("--repo-url", default="")
     ap.add_argument("--model", default="Qwen/Qwen2.5-Coder-7B-Instruct")
