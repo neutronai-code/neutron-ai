@@ -254,10 +254,12 @@ def main():
     model.save_pretrained(args.out)
     tokenizer.save_pretrained(args.out)
 
-    if args.export_gguf:
-        model.save_pretrained_gguf(f"{args.out}-gguf", tokenizer, quantization_method="q4_k_m")
     if args.push_hf:
         model.push_to_hub_merged(args.push_hf, tokenizer, save_method="merged_16bit")
+        if args.export_gguf:
+            model.push_to_hub_gguf(f"{args.push_hf}-GGUF", tokenizer, quantization_method="q4_k_m")
+    elif args.export_gguf:
+        model.save_pretrained_gguf(f"{args.out}-gguf", tokenizer, quantization_method="q4_k_m")
     print(f"Finished {args.mode.upper()} -> {args.out}")
 
 
