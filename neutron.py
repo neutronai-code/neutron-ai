@@ -21,6 +21,8 @@ Commands:
 """
 import concurrent.futures, os, shutil, subprocess, sys, time
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+
 SUBCOMMANDS = {
     "autopilot": "pipeline.py",
     "eval": "eval.py",
@@ -73,7 +75,8 @@ def run_doctor() -> int:
     def _run(item):
         label, cmd = item
         s0 = time.perf_counter()
-        p = subprocess.run(cmd, capture_output=True, text=True)
+        # Self-checks open repo files (tasks.jsonl, *.py) by relative path, so run them from the repo dir.
+        p = subprocess.run(cmd, capture_output=True, text=True, cwd=HERE)
         return label, p.returncode == 0, round(time.perf_counter() - s0, 2), (p.stderr or p.stdout).strip()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, os.cpu_count() or 4)) as pool:
@@ -102,7 +105,8 @@ def main():
     if cmd not in SUBCOMMANDS:
         print(f"Unknown command `{cmd}`. Valid: doctor, {', '.join(SUBCOMMANDS)}")
         sys.exit(1)
-    proc = subprocess.run([sys.executable, SUBCOMMANDS[cmd], *sys.argv[2:]])
+    # Absolute script path so `neutron.py` works from any cwd; user-supplied relative paths still resolve from their cwd.
+    proc = subprocess.run([sys.executable, os.path.join(HERE, SUBCOMMANDS[cmd]), *sys.argv[2:]])
     sys.exit(proc.returncode)
 
 

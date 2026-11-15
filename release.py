@@ -27,11 +27,10 @@ def build_release_bundle(
         by_cat[r.get("category", "general")].append(r)
 
     overall = sum(r.get("pass@1", 0.0) for r in eval_rows) / max(1, len(eval_rows))
-    base_overall = (
-        sum(base_map[r["id"]].get("pass@1", 0.0) for r in eval_rows if r["id"] in base_map) / max(1, len(base_map))
-        if base_map
-        else None
-    )
+    # Average base pass@1 over the tasks both reports share (dividing by len(base_map) understated the base
+    # whenever the base report had tasks the new eval lacks, inflating the published delta).
+    shared = [base_map[r["id"]].get("pass@1", 0.0) for r in eval_rows if r["id"] in base_map]
+    base_overall = sum(shared) / len(shared) if shared else None
 
     table_lines = [
         "| Category | Tasks | Base `pass@1` | **" + model_name + "** `pass@1` | Delta |",

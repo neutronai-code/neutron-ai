@@ -32,6 +32,7 @@ def run_autopilot(
     api_key: str,
     hf_repo: str,
     mock: bool,
+    repo_url: str = "",
 ) -> dict:
     t0 = time.perf_counter()
     os.makedirs(out_dir, exist_ok=True)
@@ -100,7 +101,7 @@ def run_autopilot(
         audit_stats=audit_stats,
     )
     vultr_sh = build_self_destruct_script(
-        repo_url="",
+        repo_url=repo_url,  # empty -> the generated script exits immediately instead of training nothing
         base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
         dataset="rl_clean.jsonl",
         steps=300,
@@ -135,9 +136,10 @@ if __name__ == "__main__":
     ap.add_argument("--model", default="hadron-7b")
     ap.add_argument("--api-key", default="")
     ap.add_argument("--hf-repo", default="NeutronAI/Hadron-7B-v0.9")
+    ap.add_argument("--repo-url", default="", help="Git URL the generated vultr_job.sh clones on the VM")
     ap.add_argument("--mock", action="store_true")
     args = ap.parse_args()
 
-    res = run_autopilot(args.data, args.out_dir, args.url, args.model, args.api_key, args.hf_repo, args.mock)
+    res = run_autopilot(args.data, args.out_dir, args.url, args.model, args.api_key, args.hf_repo, args.mock, args.repo_url)
     if args.mock:
         assert res["eval_pass@1"] == 1.0 and res["leaks_blocked"] == 2 and res["clean_rl_tasks"] >= 2, res

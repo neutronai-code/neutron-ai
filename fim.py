@@ -88,7 +88,11 @@ def fim_grpo_reward_func(completions, prefix, suffix, test, lang=None, repo_file
     scores = []
     for comp, pre, suf, tst, lg, rf, tp in zip(completions, prefix, suffix, test, langs, rfiles, tpaths):
         txt = comp[0]["content"] if isinstance(comp, list) else comp
-        s, _ = verify_fim(txt, pre, suf, tst, lang=lg, repo_files=rf, target_path=tp)
+        try:
+            s, _ = verify_fim(txt, pre, suf, tst, lang=lg, repo_files=rf, target_path=tp)
+        except Exception as e:  # A verifier bug must never kill a paid training run; score it 0 and keep going.
+            print(f"[fim] verifier crashed: {type(e).__name__}: {e}", flush=True)
+            s = 0.0
         scores.append(s)
     return scores
 

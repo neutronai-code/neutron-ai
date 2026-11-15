@@ -13,7 +13,7 @@ Usage:
   uv run agent.py --self-check
   uv run agent.py --repo ./some_project --test-cmd "python test_suite.py" --goal "Fix failing edge cases" --apply
 """
-import argparse, json, math, os, re, shutil, subprocess, sys, tempfile, urllib.request
+import argparse, json, math, os, re, shlex, shutil, subprocess, sys, tempfile, urllib.request
 from repomap import build_import_graph, build_repo_map
 from sandbox import apply_search_replace_blocks
 
@@ -248,7 +248,7 @@ if __name__ == "__main__":
     else:
         res = run_repo_agent(
             args.repo,
-            args.test_cmd.split(),
+            shlex.split(args.test_cmd, posix=os.name != "nt"),  # keep quoted args like -k "a or b" intact
             args.goal,
             args.url,
             args.model,

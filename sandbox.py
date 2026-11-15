@@ -7,8 +7,9 @@ CODE_BLOCK = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 THINK_BLOCK = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
+# REPLACE section may be empty (pure deletion); the lazy `??` keeps it from swallowing the next block.
 PATCH_BLOCK = re.compile(
-    r"<<<<<<+\s*SEARCH\s*\n(.*?)\n======+\s*\n(.*?)\n>>>>>>+\s*REPLACE",
+    r"<<<<<<+[ \t]*SEARCH[ \t]*\r?\n(.*?)\r?\n======+[ \t]*\r?\n(?:(.*?)\r?\n)??>>>>>>+[ \t]*REPLACE",
     re.DOTALL,
 )
 FILE_PATCH_BLOCK = re.compile(
@@ -20,6 +21,21 @@ _NODE_BIN = shutil.which("node")
 _GPP_BIN = shutil.which("g++")
 
 _EXTRA_DIRS = [os.path.dirname(b) for b in (_NODE_BIN, _GPP_BIN) if b]
+_TS_FLAGS: list[str] | None = None
+
+
+def _ts_node_flags() -> list[str]:
+    """Node 22.7-25 can run full TS (enums, parameter properties) with `--experimental-transform-types`;
+    Node 26 dropped the flag and only strips erasable types. Probe once and use it when available."""
+    global _TS_FLAGS
+    if _TS_FLAGS is None:
+        flag = "--experimental-transform-types"
+        try:
+            ok = bool(_NODE_BIN) and subprocess.run([_NODE_BIN, flag, "-e", "0"], capture_output=True, timeout=15).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            ok = False
+        _TS_FLAGS = [flag] if ok else []
+    return _TS_FLAGS
 _BASE_PATH = os.environ.get("PATH", "")
 _SAFE_ENV = {
     k: os.environ[k]
@@ -148,11 +164,9 @@ def _fuzzy_replace_once(src: str, search_str: str, replace_str: str) -> tuple[st
 
 
 def apply_search_replace_blocks(files: dict[str, str], response_text: str) -> tuple[dict[str, str] | None, str]:
+    # Scan the whole reply: models often put each file's patch in its own fenced block with the
+    # `### FILE:` header outside it, so narrowing to the last fence would silently drop files.
     cleaned = strip_think(response_text)
-    fenced = CODE_BLOCK.findall(cleaned)
-    if fenced and "<<<<<<< SEARCH" in fenced[-1]:
-        cleaned = fenced[-1]
-
     updated = dict(files)
     file_sections = FILE_PATCH_BLOCK.findall(cleaned)
     if not file_sections:
@@ -163,7 +177,7 @@ def apply_search_replace_blocks(files: dict[str, str], response_text: str) -> tu
 
     applied = 0
     for raw_path, body in file_sections:
-        rel = os.path.normpath(raw_path.strip()).replace("\\", "/")
+        rel = os.path.normpath(raw_path.strip().strip("`'\"")).replace("\\", "/")
         if rel.startswith("/") or ".." in rel.split("/"):
             return None, f"unsafe_path:{rel}"
         if rel not in updated:
@@ -305,13 +319,15 @@ def _build_cpp_harness(test_code: str, marker: str, nonce: str) -> tuple[str, li
         "#include <queue>", "#include <stack>", "#include <numeric>", "#include <cmath>",
         "#include <cstdint>", "#include <optional>", "#include <utility>", "#include <functional>", "#include <chrono>",
         *includes,
+        # JSON-escape the error text: failing asserts like `s == "abc"` or exception messages contain quotes.
+        r"""static std::string __ss_esc(const std::string& s) { std::string o; for (unsigned char c : s) { if (c == '"' || c == '\\') { o += '\\'; o += static_cast<char>(c); } else if (c < 0x20) { o += ' '; } else { o += static_cast<char>(c); } } return o; }""",
     ]
     main_lines.insert(3, "    auto __ss_t0 = std::chrono::steady_clock::now();")
     main_lines.append(
         "    double __ss_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - __ss_t0).count();"
     )
     main_lines.append(
-        f'    std::cout << "{marker}{nonce}:[" << __ss_p << "," << __ss_t << ",\\"" << __ss_err << "\\"," << __ss_ms << "]\\n";'
+        f'    std::cout << "{marker}{nonce}:[" << __ss_p << "," << __ss_t << ",\\"" << __ss_esc(__ss_err) << "\\"," << __ss_ms << "]\\n";'
     )
     main_lines.append("    return 0;\n}")
     return "\n".join(std_headers), main_lines, assert_count
@@ -356,22 +372,28 @@ def _verify_sql(solution_text: str, test_code: str, starter_code: str, files: di
         return 0.0, {"status": f"sql_error: {e}", "passed": 0, "total": 1, "ms": round((time.perf_counter() - t0) * 1000, 2)}
 
     # Evaluate top-level Python assertions against `conn` and `rows` for dense partial credit!
-    passed, total, first_err = 0, 0, "ok"
+    passed, first_err = 0, "ok"
     ns = {"conn": conn, "rows": rows}
     try:
-        tree = ast.parse(test_code)
+        try:
+            tree = ast.parse(test_code)
+        except SyntaxError as e:
+            return 0.0, {"status": f"test_syntax_error: {e.msg}", "passed": 0, "total": 1, "ms": round((time.perf_counter() - t0) * 1000, 2)}
+        # Count every assert up front so a setup failure leaves the remaining asserts as failed, not uncounted.
+        total = sum(isinstance(node, ast.Assert) for node in tree.body)
         for node in tree.body:
             code_obj = compile(ast.Module(body=[node], type_ignores=[]), "<sql_test>", "exec")
-            if isinstance(node, ast.Assert):
-                total += 1
-                try:
-                    exec(code_obj, ns)
-                    passed += 1
-                except BaseException as e:
-                    if first_err == "ok":
-                        first_err = f"{type(e).__name__}: {e}"
-            else:
+            try:
                 exec(code_obj, ns)
+                if isinstance(node, ast.Assert):
+                    passed += 1
+            except Exception as e:
+                if first_err == "ok":
+                    first_err = f"{type(e).__name__}: {e}"
+                # A failed setup line (e.g. querying a column the solution never created) means later asserts
+                # depend on missing state — stop here instead of crashing the whole GRPO run.
+                if not isinstance(node, ast.Assert):
+                    break
     finally:
         conn.close()
 
@@ -515,7 +537,7 @@ def _verify_uncached(
             compile_cmd = [_GPP_BIN, "-std=c++23", "-O2", f"-I{tmp}", *cpp_units, "-o", exe_path]
             t0 = time.perf_counter()
             try:
-                cproc = subprocess.run(compile_cmd, cwd=tmp, env=_SAFE_ENV, capture_output=True, text=True, timeout=max(15.0, timeout * 3))
+                cproc = subprocess.run(compile_cmd, cwd=tmp, env=_SAFE_ENV, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=max(15.0, timeout * 3))
             except subprocess.TimeoutExpired:
                 return 0.0, {"status": "cpp_compile_timeout", "passed": 0, "total": expected_total, "ms": 0.0}
             if cproc.returncode != 0:
@@ -560,12 +582,18 @@ def _verify_uncached(
                 with open(entry, "w", encoding="utf-8") as f:
                     f.write(f"{full_code}\n\n{harness_src}\n")
 
-            run_cmd = [_NODE_BIN, entry] if (is_js or is_ts) else [sys.executable, "-I", "-B", entry]
+            if is_ts:
+                run_cmd = [_NODE_BIN, *_ts_node_flags(), entry]
+            elif is_js:
+                run_cmd = [_NODE_BIN, entry]
+            else:
+                run_cmd = [sys.executable, "-I", "-B", entry]
             t0 = time.perf_counter()
 
         env = dict(_SAFE_ENV, PYTHONPATH=tmp)
         try:
-            proc = subprocess.run(run_cmd, cwd=tmp, env=env, capture_output=True, text=True, timeout=timeout)
+            # errors="replace": a solution printing non-UTF-8 bytes must not raise UnicodeDecodeError here.
+            proc = subprocess.run(run_cmd, cwd=tmp, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
             elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
         except subprocess.TimeoutExpired:
             return 0.0, {"status": "timeout", "passed": 0, "total": expected_total, "ms": round(timeout * 1000, 1)}
@@ -609,7 +637,14 @@ def verify_batch(
             pool.submit(verify, s, t, st, fl, lg, timeout, pb)
             for s, t, st, fl, lg, pb in zip(solutions, tests, starters, files_list, langs, perf_budgets)
         ]
-        return [f.result() for f in futs]
+        results = []
+        for f in futs:
+            try:
+                results.append(f.result())
+            except Exception as e:  # A verifier bug must never kill a paid training run; score it 0 and keep going.
+                print(f"[sandbox] verifier crashed: {type(e).__name__}: {e}", flush=True)
+                results.append((0.0, {"status": f"verifier_crash: {type(e).__name__}: {e}", "passed": 0, "total": 1, "ms": 0.0}))
+        return results
 
 
 def grpo_reward_func(completions, test, starter_code=None, files=None, lang=None, perf_budget_ms=None, **kwargs) -> list[float]:

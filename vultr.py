@@ -87,6 +87,8 @@ def build_self_destruct_script(
         f"{destroy_block}"
         "}\n"
         "trap cleanup EXIT\n\n"
+        # Fail before the slow apt/driver installs: without a repo there is nothing to train.
+        f'if [ -z "{repo_url}" ]; then echo "[NeutronAI] ERROR: no repo_url baked into this script; nothing to train."; exit 1; fi\n\n'
         "apt-get -o DPkg::Lock::Timeout=180 update -qq\n"
         "apt-get -o DPkg::Lock::Timeout=180 install -y -qq git build-essential g++ sqlite3 curl ca-certificates python3\n"
         "if ! command -v nvidia-smi >/dev/null 2>&1; then\n"
@@ -100,7 +102,7 @@ def build_self_destruct_script(
         'export PATH="$HOME/.local/bin:$PATH"\n\n'
         "nvidia-smi\n"
         "mkdir -p /workspace && cd /workspace\n"
-        f'if [ -n "{repo_url}" ]; then git clone "{repo_url}" neutron-ai && cd neutron-ai; fi\n\n'
+        f'git clone "{repo_url}" neutron-ai && cd neutron-ai\n\n'
         "uv sync --extra train\n"
         f'uv run train.py --mode grpo --model "{base_model}" --data "{dataset}" '
         f"--steps {steps} --max-minutes {max_minutes} --export-gguf {hf_flag} --out hadron-out\n"
@@ -134,6 +136,8 @@ def cmd_plans(api_key: str):
 
 
 def cmd_launch(args) -> dict:
+    if not args.repo_url:
+        raise SystemExit("--repo-url is required for launch: the VM clones it to get train.py and the dataset.")
     script = build_self_destruct_script(
         repo_url=args.repo_url,
         base_model=args.model,

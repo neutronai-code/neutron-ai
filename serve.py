@@ -14,7 +14,7 @@ Usage:
   uv run serve.py --self-check
   uv run serve.py --upstream http://localhost:11434/v1/chat/completions --upstream-model quark-1.5b --target-model hadron-7b
 """
-import argparse, concurrent.futures, json, re, sqlite3, threading, time, urllib.request
+import argparse, ast, concurrent.futures, json, re, sqlite3, threading, time, urllib.error, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from sandbox import check_ast_safety, check_cpp_safety, check_js_safety, check_sql_safety, extract_code, verify
 
@@ -38,7 +38,19 @@ def infer_prompt_smoke_test(messages: list[dict], default_lang: str = "python") 
                 checks.append(f"assert ({expr.strip()}) == ({expected.strip()})")
     for m in _INLINE_ASSERT_RE.findall(user_text):
         checks.append(m.strip())
+    if lang == "python":
+        # Prose like "assert that it handles empty input" also matches; one unparseable line would make every
+        # candidate fail verification, so keep only checks that are valid Python.
+        checks = [c for c in checks if _parses(c)]
     return "\n".join(dict.fromkeys(checks)), lang
+
+
+def _parses(src: str) -> bool:
+    try:
+        ast.parse(src)
+        return True
+    except SyntaxError:
+        return False
 
 
 class TelemetryStore:
@@ -267,14 +279,18 @@ def make_handler(cfg: dict, telemetry: TelemetryStore):
                 else None
             )
 
-            winner, meta = select_best_candidate(
-                messages,
-                upstream_fn,
-                target_fn=target_fn,
-                n_samples=int(spec.get("n", cfg["n_samples"])),
-                repair_turns=int(spec.get("repair_turns", cfg["repair_turns"])),
-                spec=spec,
-            )
+            try:
+                winner, meta = select_best_candidate(
+                    messages,
+                    upstream_fn,
+                    target_fn=target_fn,
+                    n_samples=int(spec.get("n", cfg["n_samples"])),
+                    repair_turns=int(spec.get("repair_turns", cfg["repair_turns"])),
+                    spec=spec,
+                )
+            except (urllib.error.URLError, TimeoutError, OSError, KeyError, ValueError) as e:
+                # Upstream model down or returned junk: answer with an error instead of dropping the connection.
+                return self._send_json(502, {"error": {"type": "upstream_error", "message": f"{type(e).__name__}: {e}"}})
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             model_name = req_body.get("model", "hadron-7b")
             telemetry.record(model_name, meta, elapsed_ms)

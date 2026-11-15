@@ -204,7 +204,9 @@ def main():
             warmup_ratio=0.05,
             beta=0.0,
             per_device_train_batch_size=1,
-            gradient_accumulation_steps=4,
+            # TRL requires the generation batch (per_device x grad_accum) to be divisible by num_generations;
+            # a fixed 4 broke the >=22GB path where num_generations stays at 6. Unchanged (4) on 16GB cards.
+            gradient_accumulation_steps=args.num_generations,
             num_generations=args.num_generations,
             max_prompt_length=1024,
             max_completion_length=args.max_seq_len - 1024,

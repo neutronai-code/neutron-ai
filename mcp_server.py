@@ -177,7 +177,12 @@ def serve_stdio():
         line = raw.strip()
         if not line:
             continue
-        resp = handle_rpc(json.loads(line))
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError as e:  # One malformed line must not kill the server for the whole IDE session.
+            resp = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": f"Parse error: {e}"}}
+        else:
+            resp = handle_rpc(msg) if isinstance(msg, dict) else {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
         if resp is not None:
             sys.stdout.write(json.dumps(resp) + "\n")
             sys.stdout.flush()
