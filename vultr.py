@@ -194,8 +194,14 @@ def cmd_status(api_key: str):
         ip = i.get("main_ip") or "-"
         print(f"{i.get('label', ''):22s} | {(ip if ip != '0.0.0.0' else 'pending'):15s} | {i.get('status', ''):8s} | "
               f"{i.get('server_status', ''):12s} | {i.get('plan', ''):26s} | {i.get('id', '')}")
-        if i.get("default_password"):
-            print(f"{'':22s}   root password: {i['default_password']}")
+        pw = i.get("default_password")
+        if not pw:  # the list endpoint may omit it; the single-instance endpoint returns it
+            try:
+                pw = _vultr_req("GET", f"/instances/{i['id']}", api_key).get("instance", {}).get("default_password")
+            except RuntimeError:
+                pw = None
+        if pw:
+            print(f"{'':22s}   root password: {pw}")
     ready = [i for i in insts if i.get("main_ip") and i["main_ip"] != "0.0.0.0"]
     if ready:
         print(f'\nWatch training:  ssh root@{ready[0]["main_ip"]} "tail -f /var/log/neutron-train.log"')
