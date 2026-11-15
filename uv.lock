@@ -1964,6 +1964,7 @@ train = [
     { name = "trl" },
     { name = "unsloth" },
     { name = "vllm" },
+    { name = "vllm-bnb-plugin" },
 ]
 
 [package.metadata]
@@ -1972,6 +1973,7 @@ requires-dist = [
     { name = "trl", marker = "extra == 'train'" },
     { name = "unsloth", marker = "extra == 'train'" },
     { name = "vllm", marker = "extra == 'train'" },
+    { name = "vllm-bnb-plugin", marker = "extra == 'train'" },
 ]
 provides-extras = ["train"]
 
@@ -4393,6 +4395,19 @@ sdist = { url = "https://files.pythonhosted.org/packages/f7/25/aa5684e9c59d6fc75
 wheels = [
     { url = "https://files.pythonhosted.org/packages/eb/e0/bfb969e9a03c55402f08684c2691e1e2a4307ebc9c90aae0cebadb43d9b5/vllm-0.33.0-cp38-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:e9e404f52c8494b69bd83fe99fe7ecfa9f6b89fbd156d2a9639c24ea41d6d606", size = 333472621, upload-time = "2026-11-02T10:13:42.65Z" },
     { url = "https://files.pythonhosted.org/packages/8b/a8/92e278093df40fde4c4bfd6572704bb8f398d6a2280d8c82cb5efaf12047/vllm-0.33.0-cp38-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:4b6bdec4ab269990bf70d45a3c1e94c3760a27064513760193b26d6f0da883aa", size = 336361138, upload-time = "2026-11-02T10:13:18.631Z" },
+]
+
+[[package]]
+name = "vllm-bnb-plugin"
+version = "0.0.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "bitsandbytes" },
+    { name = "vllm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d8/b8/53c7cc5cbfcc77569d3d6b6f8e4b4f604887dc15ffb379d4ca4e12dc4291/vllm_bnb_plugin-0.0.3.tar.gz", hash = "sha256:e884654a25a8b2a15f41644e0be28b811a176ffbe31a58a9ccc22aefc6525c7c", size = 24347, upload-time = "2026-08-24T16:41:53.853Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cd/76/2d56ecab32e131364014fda899bf567163df52a5d9e7b87a03586f1f87ab/vllm_bnb_plugin-0.0.3-py3-none-any.whl", hash = "sha256:46d5ce93018ea8daf92bc15235f19a01078e1f4c16303f5946cc1575404c094c", size = 24315, upload-time = "2026-08-24T16:41:52.741Z" },
 ]
 
 [[package]]

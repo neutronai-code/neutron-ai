@@ -15,6 +15,7 @@ What `vultr.py` solves (100% Python stdlib, zero SDK bloat):
 Usage:
   uv run vultr.py --self-check
   $env:VULTR_API_KEY="..."; uv run vultr.py plans
+  $env:VULTR_API_KEY="..."; uv run vultr.py status   # your VMs + IPs (password is printed once, at launch)
   uv run vultr.py script --hf-repo NeutronAI/Hadron-7B-v0.9 --steps 300 --max-minutes 60
   $env:VULTR_API_KEY="..."; $env:HF_TOKEN="..."; uv run vultr.py launch --plan vcg-a100-1c-6g-16vram --region ewr --hf-repo NeutronAI/Hadron-7B-v0.9 --dry-run
 """
@@ -172,8 +173,32 @@ def cmd_launch(args) -> dict:
 
     created = _vultr_req("POST", "/instances", args.api_key, payload)
     inst = created.get("instance", {})
-    print(f"Launched Vultr GPU instance {inst.get('id')} ({args.plan} in {args.region}) — auto-destroy on exit ARMED.")
+    print(f"Launched Vultr GPU instance {inst.get('id')} ({args.plan} in {args.region}) - auto-destroy on exit ARMED.")
+    # Vultr returns the root password ONLY in this create response, so show it now.
+    if inst.get("default_password"):
+        print(f"  root password : {inst['default_password']}   (shown once - copy it now)")
+    ip = inst.get("main_ip", "")
+    print(f"  IP address    : {ip if ip and ip != '0.0.0.0' else 'not assigned yet - run `uv run vultr.py status` in ~1 min'}")
     return created
+
+
+def cmd_status(api_key: str):
+    """List your instances with IP + state, so you can `ssh root@<ip>` without opening the dashboard."""
+    insts = _vultr_req("GET", "/instances?per_page=100", api_key).get("instances", [])
+    if not insts:
+        print("No Vultr instances (nothing is billing).")
+        return
+    print(f"{'LABEL':22s} | {'IP':15s} | {'STATUS':8s} | {'SERVER':12s} | {'PLAN':26s} | ID")
+    print("-" * 120)
+    for i in insts:
+        ip = i.get("main_ip") or "-"
+        print(f"{i.get('label', ''):22s} | {(ip if ip != '0.0.0.0' else 'pending'):15s} | {i.get('status', ''):8s} | "
+              f"{i.get('server_status', ''):12s} | {i.get('plan', ''):26s} | {i.get('id', '')}")
+        if i.get("default_password"):
+            print(f"{'':22s}   root password: {i['default_password']}")
+    ready = [i for i in insts if i.get("main_ip") and i["main_ip"] != "0.0.0.0"]
+    if ready:
+        print(f'\nWatch training:  ssh root@{ready[0]["main_ip"]} "tail -f /var/log/neutron-train.log"')
 
 
 def run_self_check():
@@ -194,7 +219,7 @@ def run_self_check():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("action", nargs="?", default="script", choices=["plans", "script", "launch"])
+    ap.add_argument("action", nargs="?", default="script", choices=["plans", "script", "launch", "status"])
     ap.add_argument("--api-key", default=os.environ.get("VULTR_API_KEY", ""))
     ap.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""))
     ap.add_argument("--plan", default="vcg-a100-1c-6g-16vram")
@@ -219,6 +244,8 @@ if __name__ == "__main__":
         run_self_check()
     elif args.action == "plans":
         cmd_plans(args.api_key)
+    elif args.action == "status":
+        cmd_status(args.api_key)
     elif args.action == "launch":
         cmd_launch(args)
     else:
