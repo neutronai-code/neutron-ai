@@ -6,4 +6,4 @@ requires-python = ">=3.12,<3.14"
 dependencies = []
 
 [project.optional-dependencies]
-train = ["unsloth", "vllm", "trl", "datasets"]
+train = ["unsloth", "vllm", "vllm-bnb-plugin", "trl", "datasets"]

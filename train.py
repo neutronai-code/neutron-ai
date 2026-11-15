@@ -113,14 +113,21 @@ def main():
     args = ap.parse_args()
 
     # ponytail: single-GPU Unsloth handles 1.5B-32B; upgrade to multi-node verl/OpenRLHF when funded past 1x H100.
+    import torch
     from unsloth import FastLanguageModel, PatchDPOTrainer, is_bfloat16_supported
+
+    vram_gb = (torch.cuda.get_device_properties(0).total_memory / (1024**3)) if torch.cuda.is_available() else 0.0
+    # Use vLLM fast_inference on >=24GB single GPUs; on 16GB cards (e.g. A16/T4) use Unsloth native generation to avoid OOM!
+    use_vllm = (args.mode in ("grpo", "fim-grpo")) and (vram_gb >= 22.0)
+    if vram_gb > 0 and vram_gb < 22.0 and args.num_generations > 4:
+        args.num_generations = 4
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model,
         max_seq_length=args.max_seq_len,
         load_in_4bit=True,
-        fast_inference=(args.mode in ("grpo", "fim-grpo")),
-        gpu_memory_utilization=0.65,
+        fast_inference=use_vllm,
+        gpu_memory_utilization=0.65 if vram_gb >= 22.0 else 0.55,
     )
     if not hasattr(model, "peft_config"):
         model = FastLanguageModel.get_peft_model(

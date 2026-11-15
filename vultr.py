@@ -92,6 +92,7 @@ def build_self_destruct_script(
         "if ! command -v nvidia-smi >/dev/null 2>&1; then\n"
         '  echo "[NeutronAI] Installing NVIDIA headless server driver..."\n'
         "  apt-get -o DPkg::Lock::Timeout=180 install -y -qq ubuntu-drivers-common && ubuntu-drivers install --gpgpu || true\n"
+        "  modprobe nvidia || true\n"
         "fi\n"
         "curl -fsSL https://deb.nodesource.com/setup_24.x | bash -\n"
         "apt-get -o DPkg::Lock::Timeout=180 install -y -qq nodejs\n"
@@ -194,8 +195,8 @@ if __name__ == "__main__":
     ap.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""))
     ap.add_argument("--plan", default="vcg-a100-1c-6g-16vram")
     ap.add_argument("--region", default="ewr")
-    ap.add_argument("--os-id", type=int, default=2284, help="Vultr OS ID (2284 = Ubuntu 24.04 x64)")
-    ap.add_argument("--image-id", default="mldev", help="Vultr GPU Marketplace image_id (`mldev` = pre-installed NVIDIA CUDA/ML stack; pass '' for bare OS)")
+    ap.add_argument("--os-id", type=int, default=2284, help="Vultr OS ID (2284 = Ubuntu 24.04 x64; Vultr auto-installs GPU drivers on vcg-* plans)")
+    ap.add_argument("--image-id", default="", help="Optional Vultr Marketplace image_id")
     ap.add_argument("--label", default="neutron-hadron-rlvr")
     ap.add_argument("--repo-url", default="")
     ap.add_argument("--model", default="Qwen/Qwen2.5-Coder-7B-Instruct")
