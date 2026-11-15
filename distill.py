@@ -13,35 +13,93 @@ Usage (PowerShell):
   uv run distill.py --limit 3 --effort low          # quick test
   uv run distill.py                                  # all tasks in train_clean.jsonl
 """
-import argparse, concurrent.futures, json, os, threading, time, urllib.error, urllib.request
+import argparse, concurrent.futures, json, os, random, threading, time, urllib.error, urllib.request
 from repair import system_prompt_for
 from sandbox import verify
 
 
-def chat(base_url: str, api_key: str, model: str, messages: list[dict], effort: str, max_tokens: int, timeout: float) -> dict:
+class Deferred(Exception):
+    """Temporary API trouble (rate limit, outage): the task is NOT marked failed and is retried on the next run."""
+
+
+class AdaptiveLimiter:
+    """Caps in-flight requests. A 429 lowers the cap by one (at most every 15s); a streak of successes raises it."""
+
+    def __init__(self, max_concurrency: int):
+        self.max = max(1, max_concurrency)
+        self.limit = self.max
+        self.active = 0
+        self.streak = 0
+        self.last_drop = 0.0
+        self.cv = threading.Condition()
+
+    def __enter__(self):
+        with self.cv:
+            while self.active >= self.limit:
+                self.cv.wait()
+            self.active += 1
+
+    def __exit__(self, *exc):
+        with self.cv:
+            self.active -= 1
+            self.cv.notify_all()
+
+    def throttled(self):
+        with self.cv:
+            self.streak = 0
+            if self.limit > 1 and time.time() - self.last_drop > 15:
+                self.limit -= 1
+                self.last_drop = time.time()
+                print(f"  [rate limit] slowing down to {self.limit} request(s) at a time", flush=True)
+
+    def succeeded(self):
+        with self.cv:
+            self.streak += 1
+            if self.limit < self.max and self.streak >= 20:
+                self.limit += 1
+                self.streak = 0
+                print(f"  [rate limit] speeding up to {self.limit} request(s) at a time", flush=True)
+                self.cv.notify_all()
+
+
+LIMITER = AdaptiveLimiter(4)
+_SHOWN_429 = threading.Event()
+
+
+def chat(base_url: str, api_key: str, model: str, messages: list[dict], effort: str, max_tokens: int, timeout: float,
+         max_wait: float = 1800.0) -> dict:
     body = {"model": model, "messages": messages, "max_tokens": max_tokens}
     if effort:
         body["reasoning_effort"] = effort
-    req = urllib.request.Request(
-        f"{base_url.rstrip('/')}/chat/completions",
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-    )
-    for attempt in range(5):
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            if e.code in (429, 500, 502, 503, 504) and attempt < 4:
-                time.sleep(2 ** attempt * 3)
-                continue
-            raise RuntimeError(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:300]}") from None
-        except (urllib.error.URLError, TimeoutError) as e:
-            if attempt < 4:
-                time.sleep(2 ** attempt * 3)
-                continue
-            raise RuntimeError(f"network: {e}") from None
-    raise RuntimeError("unreachable")
+    data = json.dumps(body).encode("utf-8")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    waited, attempt = 0.0, 0
+    while True:
+        req = urllib.request.Request(f"{base_url.rstrip('/')}/chat/completions", data=data, headers=headers)
+        code, detail = None, ""
+        with LIMITER:
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    resp = json.loads(r.read().decode("utf-8"))
+                LIMITER.succeeded()
+                return resp
+            except urllib.error.HTTPError as e:
+                code, detail = e.code, e.read().decode("utf-8", "replace")[:400]
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                code, detail = "network", str(e)
+        if code == 429:
+            LIMITER.throttled()
+            if not _SHOWN_429.is_set():
+                _SHOWN_429.set()
+                print(f"  [rate limit] first 429 from the API: {detail}", flush=True)
+        elif code not in ("network", 500, 502, 503, 504):
+            raise RuntimeError(f"HTTP {code}: {detail[:300]}")  # e.g. 400 bad request: a real, permanent failure
+        delay = min(60.0, 5.0 * 2 ** attempt) + random.uniform(0, 3)
+        attempt += 1
+        waited += delay
+        if waited > max_wait:
+            raise Deferred(f"gave up after {int(waited)}s of {code} errors")
+        time.sleep(delay)
 
 
 def split_reply(resp: dict) -> tuple[str, str, str]:
@@ -61,7 +119,9 @@ def solve(task: dict, model: str, args) -> dict:
     try:
         resp = chat(args.base_url, args.api_key, model, messages, args.effort, args.max_tokens, args.timeout)
         reasoning, answer, finish = split_reply(resp)
-    except Exception as e:  # network/API failure: record and move on
+    except Deferred as e:
+        return {"ok": False, "deferred": True, "why": str(e), "model": model}
+    except Exception as e:  # permanent API error (e.g. 400): record and move on
         return {"ok": False, "why": f"api_error: {e}", "model": model}
     if not answer:
         return {"ok": False, "why": f"empty_answer (finish={finish})", "model": model}
@@ -95,7 +155,7 @@ def run_task(task: dict, args) -> dict:
     last = {}
     for model in tries:
         last = solve(task, model, args)
-        if last["ok"]:
+        if last["ok"] or last.get("deferred"):  # don't burn the fallback on a rate limit
             return last
     return last
 
@@ -111,7 +171,10 @@ def main():
     ap.add_argument("--max-think-chars", type=int, default=40000, help="drop traces longer than this (~11K tokens)")
     ap.add_argument("--max-tokens", type=int, default=32000)
     ap.add_argument("--timeout", type=float, default=600.0)
-    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--concurrency", "--workers", type=int, default=4,
+                    help="max requests in flight; drops automatically when the API says 429 (too many requests)")
+    ap.add_argument("--max-wait", type=float, default=1800.0, help="seconds to keep retrying one rate-limited request")
+    ap.add_argument("--shuffle", action="store_true", help="process tasks in a random (fixed-seed) order")
     ap.add_argument("--limit", type=int, default=0, help="only the first N pending tasks (0 = all)")
     ap.add_argument("--retry-failed", action="store_true", help="also retry tasks listed in <out>.failed.jsonl")
     ap.add_argument("--base-url", default="https://api.onysoft.com/v1")
@@ -124,22 +187,36 @@ def main():
         tasks = [json.loads(l) for l in f if l.strip()]
     failed_path = args.out + ".failed.jsonl"
 
-    def ids_in(path):
+    def ids_in(path, transient_ok=False):
         if not os.path.exists(path):
             return set()
+        ids = set()
         with open(path, encoding="utf-8") as f:
-            return {json.loads(l).get("id") for l in f if l.strip()}
+            for line in f:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                why = row.get("why", "")
+                # Older runs logged rate limits / outages as failures; those deserve another try.
+                if transient_ok and why.startswith(("api_error: HTTP 429", "api_error: HTTP 5", "api_error: network")):
+                    continue
+                ids.add(row.get("id"))
+        return ids
 
-    skip = ids_in(args.out) | (set() if args.retry_failed else ids_in(failed_path))
+    skip = ids_in(args.out) | (set() if args.retry_failed else ids_in(failed_path, transient_ok=True))
     pending = [t for t in tasks if t.get("id") not in skip]
+    if args.shuffle:
+        random.Random(0).shuffle(pending)
     if args.limit:
         pending = pending[: args.limit]
+    LIMITER.max = LIMITER.limit = max(1, args.concurrency)
     print(f"{len(tasks)} tasks | {len(skip)} already done/failed | running {len(pending)} with {args.model} "
-          f"(effort={args.effort or 'default'}, fallback={args.fallback_model or 'none'})", flush=True)
+          f"(effort={args.effort or 'default'}, fallback={args.fallback_model or 'none'}, up to {LIMITER.max} at a time)", flush=True)
 
     lock = threading.Lock()
-    stats = {"ok": 0, "fail": 0, "by_teacher": {}}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
+    stats = {"ok": 0, "fail": 0, "deferred": 0, "by_teacher": {}}
+    t_start = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=LIMITER.max) as pool:
         futs = {pool.submit(run_task, t, args): t for t in pending}
         for i, fut in enumerate(concurrent.futures.as_completed(futs), 1):
             task = futs[fut]
@@ -154,17 +231,23 @@ def main():
                     with open(args.out, "a", encoding="utf-8") as f:
                         f.write(json.dumps(res["row"]) + "\n")
                     tag = f"PASS ({res['model'].split('/')[-1]}, {res['seconds']}s)"
+                elif res.get("deferred"):
+                    stats["deferred"] += 1
+                    tag = f"DEFERRED (retried next run): {res['why'][:70]}"
                 else:
                     stats["fail"] += 1
                     with open(failed_path, "a", encoding="utf-8") as f:
                         f.write(json.dumps({"id": task.get("id"), "lang": task.get("lang"), "why": res["why"]}) + "\n")
                     tag = f"FAIL {res['why'][:90]}"
-                print(f"[{i}/{len(pending)}] {task.get('id', '?'):40s} {tag}", flush=True)
+                rate = i / max(1e-9, time.time() - t_start) * 3600
+                print(f"[{i}/{len(pending)}] {task.get('id', '?'):40s} {tag}   (~{rate:.0f} tasks/hr)", flush=True)
 
-    total = stats["ok"] + stats["fail"]
+    total = stats["ok"] + stats["fail"] + stats["deferred"]
     print(f"\nKept {stats['ok']}/{total} verified traces -> {args.out}   by teacher: {stats['by_teacher']}")
     if stats["fail"]:
         print(f"Failures logged to {failed_path} (rerun with --retry-failed to try them again)")
+    if stats["deferred"]:
+        print(f"{stats['deferred']} task(s) hit rate limits/outages; just run the same command again to finish them.")
 
 
 if __name__ == "__main__":

@@ -152,7 +152,8 @@ def _identifiers(node: ast.AST):
         yield node.name
 
 
-def check_ast_safety(code: str, filename: str = "<solution>") -> str | None:
+def check_ast_safety(code: str, filename: str = "<solution>", allow: frozenset = frozenset()) -> str | None:
+    """`allow` relaxes specific bans (e.g. stdin programs legitimately call input()/exit() and use threading)."""
     tree = ast.parse(code, filename=filename)
     imported = {
         (a.asname or a.name).split(".")[0]
@@ -168,11 +169,11 @@ def check_ast_safety(code: str, filename: str = "<solution>") -> str | None:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root = alias.name.split(".")[0]
-                if root in _BANNED_MODULES:
+                if root in _BANNED_MODULES and root not in allow:
                     return f"banned_import:{root}"
         elif isinstance(node, ast.ImportFrom) and node.module:
             root = node.module.split(".")[0]
-            if root in _BANNED_MODULES:
+            if root in _BANNED_MODULES and root not in allow:
                 return f"banned_import:{root}"
             for alias in node.names:
                 fs_module = root in ("os", "posix", "nt", "pathlib", "io")  # `from dataclasses import replace` is fine
@@ -182,11 +183,12 @@ def check_ast_safety(code: str, filename: str = "<solution>") -> str | None:
             if node.attr in _BANNED_ATTRS:
                 return f"banned_attr:{node.attr}"
             if isinstance(node.value, ast.Name) and node.value.id == "sys" and node.attr in {"exit", "modules", "_getframe"}:
-                return f"banned_attr:sys.{node.attr}"
+                if f"sys.{node.attr}" not in allow:
+                    return f"banned_attr:sys.{node.attr}"
             if node.attr in _BANNED_MODULE_ATTRS and isinstance(node.value, ast.Name) and node.value.id in imported:
                 return f"banned_attr:{node.value.id}.{node.attr}"
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            if node.func.id in _BANNED_CALLS:
+            if node.func.id in _BANNED_CALLS and node.func.id not in allow:
                 return f"banned_call:{node.func.id}"
             if node.func.id == "type" and len(node.args) == 3:  # dynamic class creation can spoof __module__
                 return "banned_call:type/3"
@@ -914,6 +916,87 @@ def verify(
     return score, info
 
 
+# --- stdin/stdout programs (competitive-programming style tasks, lang="python_stdio") ---------------------------
+# `test_code` is a JSON list of {"input": str, "output": str}. Each test runs the program as its own process and
+# compares stdout with the expected output; the program never sees the expected output, so there is nothing to forge.
+_STDIO_ALLOW = frozenset({"input", "exit", "quit", "sys.exit", "threading"})
+_STDIO_MAX_TESTS = 12
+
+
+def _stdio_outputs_match(got: str, want: str) -> bool:
+    """Whitespace-insensitive token compare; numeric tokens may differ by 1e-6 relative (float formatting)."""
+    g, w = got.split(), want.split()
+    if g == w:
+        return True
+    if len(g) != len(w):
+        return False
+    for a, b in zip(g, w):
+        if a == b:
+            continue
+        try:
+            fa, fb = float(a), float(b)
+        except ValueError:
+            return False
+        if not abs(fa - fb) <= 1e-6 * max(1.0, abs(fb)):
+            return False
+    return True
+
+
+def _pick_tests(tests: list, k: int = _STDIO_MAX_TESTS) -> list:
+    """First few tests (usually the statement's examples) plus an even spread of the rest."""
+    if len(tests) <= k:
+        return tests
+    head = tests[:4]
+    rest = tests[4:]
+    step = len(rest) / (k - 4)
+    return head + [rest[int(i * step)] for i in range(k - 4)]
+
+
+def _verify_stdio(solution_text: str, test_code: str, timeout: float) -> tuple[float, dict]:
+    t0 = time.perf_counter()
+    try:
+        tests = [(str(t["input"]), str(t["output"])) for t in json.loads(test_code)]
+    except (ValueError, TypeError, KeyError):
+        return 0.0, {"status": "bad_stdio_tests", "passed": 0, "total": 1, "ms": 0.0}
+    tests = _pick_tests(tests)
+    total = len(tests) or 1
+    code = extract_code(solution_text)
+    if not code:
+        return -0.5, {"status": "empty", "passed": 0, "total": total, "ms": 0.0}
+    try:
+        v = check_ast_safety(code, allow=_STDIO_ALLOW)
+    except SyntaxError as e:
+        return 0.0, {"status": f"syntax_error: {e.msg}", "passed": 0, "total": total, "ms": 0.0}
+    if v:
+        return -0.5, {"status": v, "passed": 0, "total": total, "ms": 0.0}
+
+    per_test = min(max(timeout, 2.0), 6.0)
+    passed, first_err = 0, "ok"
+    with tempfile.TemporaryDirectory(prefix="neutron_io_") as tmp:
+        path = os.path.join(tmp, "main.py")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(code)
+        for i, (inp, want) in enumerate(tests, 1):
+            try:
+                p = subprocess.run([sys.executable, "-I", "-B", path], input=inp, cwd=tmp, env=_SAFE_ENV, capture_output=True,
+                                   text=True, encoding="utf-8", errors="replace", timeout=per_test)
+            except subprocess.TimeoutExpired:
+                if first_err == "ok":
+                    first_err = f"timeout on test {i}"
+                break  # a too-slow solution will time out on the remaining (larger) tests too
+            if p.returncode == 0 and _stdio_outputs_match(p.stdout, want):
+                passed += 1
+            elif first_err == "ok":
+                if p.returncode != 0:
+                    lines = (p.stderr or "").strip().splitlines()
+                    first_err = f"test {i}: {lines[-1][:150] if lines else f'exit {p.returncode}'}"
+                else:
+                    first_err = f"test {i}: wrong answer (got {p.stdout.strip()[:40]!r}, want {want.strip()[:40]!r})"
+    ms = round((time.perf_counter() - t0) * 1000, 2)
+    reward = 1.0 if passed == total else round(0.1 + 0.9 * passed / total, 4)
+    return reward, {"status": first_err, "passed": passed, "total": total, "ms": ms, "algo_ms": ms}
+
+
 def _verify_uncached(
     solution_text: str,
     test_code: str,
@@ -924,6 +1007,8 @@ def _verify_uncached(
 ) -> tuple[float, dict]:
     if lang in ("sql", "sqlite"):
         return _verify_sql(solution_text, test_code, starter_code, files)
+    if lang in ("python_stdio", "stdio"):
+        return _verify_stdio(solution_text, test_code, timeout)
 
     is_cpp = lang in ("cpp", "c++", "cxx", "cc")
     is_ts = lang in ("typescript", "ts")

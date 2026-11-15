@@ -21,6 +21,10 @@ JS_SYS = "Think step-by-step inside <think>...</think>, then output only valid J
 TS_SYS = "Think step-by-step inside <think>...</think>, then output only valid TypeScript code inside a ```typescript ... ``` block."
 CPP_SYS = "Think step-by-step inside <think>...</think>, then output only valid C++23 code (no `main()`) inside a ```cpp ... ``` block."
 SQL_SYS = "Think step-by-step inside <think>...</think>, then output only valid SQLite SQL inside a ```sql ... ``` block."
+STDIO_SYS = (
+    "Think step-by-step inside <think>...</think>, then output a complete Python 3 program that reads the input "
+    "from standard input and prints the answer to standard output, inside a ```python ... ``` block."
+)
 REPO_SYS = (
     "Think step-by-step inside <think>...</think>, then output exact `### FILE: <path>` and "
     "`<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE` patch blocks."
@@ -31,6 +35,8 @@ def system_prompt_for(task: dict) -> str:
     if task.get("files"):
         return REPO_SYS
     lg = (task.get("lang") or "python").lower()
+    if lg in ("python_stdio", "stdio"):
+        return STDIO_SYS
     if lg in ("sql", "sqlite"):
         return SQL_SYS
     if lg in ("cpp", "c++", "cxx", "cc"):
