@@ -51,6 +51,7 @@ def build_self_destruct_script(
     max_minutes: int,
     hf_repo: str,
     auto_destroy: bool = True,
+    train_args: str = "",
 ) -> str:
     """Bash startup script with `trap cleanup EXIT` that uploads run logs & destroys its own Vultr VM even on crash."""
     log_upload_block = (
@@ -106,7 +107,7 @@ def build_self_destruct_script(
         f'git clone "{repo_url}" neutron-ai && cd neutron-ai\n\n'
         "uv sync --extra train\n"
         f'uv run train.py --mode grpo --model "{base_model}" --data "{dataset}" '
-        f"--steps {steps} --max-minutes {max_minutes} --export-gguf {hf_flag} --out hadron-out\n"
+        f"--steps {steps} --max-minutes {max_minutes} --export-gguf {hf_flag} --out hadron-out {train_args}\n"
     )
 
 
@@ -147,6 +148,7 @@ def cmd_launch(args) -> dict:
         max_minutes=args.max_minutes,
         hf_repo=args.hf_repo,
         auto_destroy=not args.keep_alive,
+        train_args=args.train_args,
     )
     # Inject runtime secrets into top of cloud-init script over HTTPS only when launching
     injected = (
@@ -241,6 +243,7 @@ if __name__ == "__main__":
     ap.add_argument("--hf-repo", default="")
     ap.add_argument("--out-script", default="vultr_job.sh")
     ap.add_argument("--keep-alive", action="store_true", help="Disable automatic VM DELETE on exit")
+    ap.add_argument("--train-args", default="", help='Extra train.py flags, e.g. "--max-seq-len 16384 --thinking on"')
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--confirm", action="store_true", help="Required to actually create a billable Vultr VM")
     ap.add_argument("--self-check", action="store_true")
@@ -255,7 +258,7 @@ if __name__ == "__main__":
     elif args.action == "launch":
         cmd_launch(args)
     else:
-        s = build_self_destruct_script(args.repo_url, args.model, args.data, args.steps, args.max_minutes, args.hf_repo, not args.keep_alive)
+        s = build_self_destruct_script(args.repo_url, args.model, args.data, args.steps, args.max_minutes, args.hf_repo, not args.keep_alive, args.train_args)
         with open(args.out_script, "w", encoding="utf-8", newline="\n") as f:
             f.write(s)
         print(f"Wrote self-destructing Vultr GPU job script -> {args.out_script}")

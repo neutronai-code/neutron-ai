@@ -16,17 +16,47 @@ from repair import CODE_SYS, system_prompt_for
 from sandbox import grpo_reward_func, reasoning_format_reward_func
 
 
-def load_rl_dataset(source: str):
+def is_vision_model(model_name: str) -> bool:
+    """Qwen3.5 and similar ship as image-text-to-text models, which need Unsloth's FastModel loader."""
+    try:
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(model_name)
+    except Exception:
+        return False
+    archs = getattr(cfg, "architectures", None) or []
+    return hasattr(cfg, "vision_config") or any(a.endswith("ForConditionalGeneration") for a in archs)
+
+
+def make_prompt_renderer(tokenizer, thinking: str, max_completion: int):
+    """Return (render_fn, thinking_on). render_fn is None to keep TRL's conversational prompts (old behaviour).
+
+    Models whose chat template has a thinking switch (Qwen3/3.5) think by default and need 32K+ tokens for it;
+    with a small completion budget nearly every answer would be cut off mid-thought and score 0. So:
+    `auto` turns thinking on only when the completion budget is >= 8192 tokens (e.g. A100 runs), else off."""
+    template = getattr(tokenizer, "chat_template", None) or ""
+    if "enable_thinking" not in template:
+        return None, False
+    on = thinking == "on" or (thinking == "auto" and max_completion >= 8192)
+
+    def render(messages):
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=on)
+
+    return render, on
+
+
+def load_rl_dataset(source: str, render=None):
     from datasets import Dataset, load_dataset
 
+    fmt = render or (lambda messages: messages)
     if source == "mbpp":
         ds = load_dataset("google-research-datasets/mbpp", "sanitized", split="train")
         return Dataset.from_list([
             {
-                "prompt": [
+                "prompt": fmt([
                     {"role": "system", "content": CODE_SYS},
                     {"role": "user", "content": f"{r['prompt']}\n\nExample check:\n{r['test_list'][0]}"},
-                ],
+                ]),
                 "test": "\n".join(r["test_imports"] + r["test_list"]),
                 "starter_code": "",
                 "files": "",
@@ -41,10 +71,10 @@ def load_rl_dataset(source: str):
     rows.sort(key=lambda r: abs(r.get("baseline_pass_rate", 0.5) - 0.5))
     return Dataset.from_list([
         {
-            "prompt": [
+            "prompt": fmt([
                 {"role": "system", "content": system_prompt_for(r)},
                 {"role": "user", "content": r["prompt"]},
-            ],
+            ]),
             "test": r["test"],
             "starter_code": r.get("starter_code", ""),
             "files": json.dumps(r["files"]) if r.get("files") else "",
@@ -110,34 +140,58 @@ def main():
     ap.add_argument("--export-gguf", action="store_true")
     ap.add_argument("--push-hf", default="")
     ap.add_argument("--out", default="hadron-v0.9")
+    ap.add_argument("--thinking", choices=["auto", "on", "off"], default="auto",
+                    help="Qwen3/3.5 thinking mode. auto = on only if the completion budget (max-seq-len - 1024) >= 8192")
+    ap.add_argument("--load-in-4bit", choices=["auto", "yes", "no"], default="auto",
+                    help="auto = 4-bit below 40GB VRAM, bf16 on bigger GPUs (A100 80GB)")
     args = ap.parse_args()
 
     # ponytail: single-GPU Unsloth handles 1.5B-32B; upgrade to multi-node verl/OpenRLHF when funded past 1x H100.
     import torch
-    from unsloth import FastLanguageModel, PatchDPOTrainer, is_bfloat16_supported
+    from unsloth import FastLanguageModel, FastModel, PatchDPOTrainer, is_bfloat16_supported
 
     vram_gb = (torch.cuda.get_device_properties(0).total_memory / (1024**3)) if torch.cuda.is_available() else 0.0
     # Use vLLM fast_inference on >=24GB single GPUs; on 16GB cards (e.g. A16/T4) use Unsloth native generation to avoid OOM!
     use_vllm = (args.mode in ("grpo", "fim-grpo")) and (vram_gb >= 22.0)
     if vram_gb > 0 and vram_gb < 22.0 and args.num_generations > 4:
         args.num_generations = 4
+    load_4bit = args.load_in_4bit == "yes" or (args.load_in_4bit == "auto" and vram_gb < 40.0)
+    vision = is_vision_model(args.model)
+    print(f"[NeutronAI] model={args.model} vision_arch={vision} vram={vram_gb:.0f}GB 4bit={load_4bit} vllm={use_vllm}", flush=True)
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=args.model,
-        max_seq_length=args.max_seq_len,
-        load_in_4bit=True,
-        fast_inference=use_vllm,
-        gpu_memory_utilization=0.65 if vram_gb >= 22.0 else 0.55,
-    )
+    loader = FastModel if vision else FastLanguageModel
+    load_kwargs = dict(model_name=args.model, max_seq_length=args.max_seq_len, load_in_4bit=load_4bit)
+    if use_vllm or not vision:  # keep the original FastLanguageModel call unchanged for text models
+        load_kwargs.update(fast_inference=use_vllm, gpu_memory_utilization=0.65 if vram_gb >= 22.0 else 0.55)
+    model, tokenizer = loader.from_pretrained(**load_kwargs)
     if not hasattr(model, "peft_config"):
-        model = FastLanguageModel.get_peft_model(
-            model,
-            r=32,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-            lora_alpha=32,
-            use_gradient_checkpointing="unsloth",
-            random_state=42,
-        )
+        if vision:
+            # Text-only training: LoRA on the language model's attention + MLP, vision tower frozen.
+            model = FastModel.get_peft_model(
+                model,
+                finetune_vision_layers=False,
+                finetune_language_layers=True,
+                finetune_attention_modules=True,
+                finetune_mlp_modules=True,
+                r=32,
+                lora_alpha=32,
+                use_gradient_checkpointing="unsloth",
+                random_state=42,
+            )
+        else:
+            model = FastLanguageModel.get_peft_model(
+                model,
+                r=32,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                lora_alpha=32,
+                use_gradient_checkpointing="unsloth",
+                random_state=42,
+            )
+    # Vision models come with a multimodal processor; all our data is text, so use its inner text tokenizer.
+    if vision:
+        tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+    render, thinking_on = make_prompt_renderer(tokenizer, args.thinking, args.max_seq_len - 1024)
+    print(f"[NeutronAI] thinking={'on' if thinking_on else 'off'} (max completion {args.max_seq_len - 1024} tokens)", flush=True)
 
     callbacks = [_make_wallclock_guard(args.max_minutes)] if args.max_minutes > 0 else []
 
@@ -226,12 +280,13 @@ def main():
 
             with open(args.data, encoding="utf-8") as f:
                 fim_rows = [json.loads(l) for l in f if l.strip()]
+            fmt = render or (lambda messages: messages)
             fim_ds = Dataset.from_list([
                 {
-                    "prompt": [
+                    "prompt": fmt([
                         {"role": "system", "content": f"Complete ONLY the missing `{r.get('lang', 'python')}` code between <PREFIX> and <SUFFIX> inside a fenced block."},
                         {"role": "user", "content": r.get("fim_prompt") or f"<PREFIX>\n{r['prefix']}</PREFIX>\n<SUFFIX>\n{r['suffix']}</SUFFIX>"},
-                    ],
+                    ]),
                     "prefix": r["prefix"],
                     "suffix": r["suffix"],
                     "test": r["test"],
@@ -256,7 +311,7 @@ def main():
                 reward_funcs=[grpo_reward_func, reasoning_format_reward_func],
                 callbacks=callbacks,
                 args=GRPOConfig(**cfg_kwargs),
-                train_dataset=load_rl_dataset(args.data),
+                train_dataset=load_rl_dataset(args.data, render),
             )
 
     trainer.train(resume_from_checkpoint=args.resume)

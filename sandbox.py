@@ -111,7 +111,12 @@ _SQL_BANNED = re.compile(r"\b(?:ATTACH\s+DATABASE|LOAD_EXTENSION|PRAGMA\s+writab
 
 
 def strip_think(text: str) -> str:
-    return THINK_BLOCK.sub("", text).strip()
+    text = THINK_BLOCK.sub("", text)
+    # Thinking models (Qwen3.5) often get `<think>` opened by the chat template inside the prompt, so the
+    # completion only contains `...reasoning...</think> answer`. Keep just the answer.
+    if "</think>" in text and "<think>" not in text:
+        text = text.rsplit("</think>", 1)[1]
+    return text.strip()
 
 
 def extract_code(text: str) -> str:
@@ -1113,7 +1118,7 @@ def reasoning_format_reward_func(completions, files=None, **kwargs) -> list[floa
     for comp, fl in zip(completions, raw_files):
         text = (comp[0]["content"] if isinstance(comp, list) else comp).strip()
         is_repo = bool(json.loads(fl) if isinstance(fl, str) and fl else fl)
-        score = 0.05 if THINK_BLOCK.search(text) else 0.0
+        score = 0.05 if (THINK_BLOCK.search(text) or "</think>" in text) else 0.0  # template may open <think>
         body = strip_think(text)
         if is_repo:
             if "<<<<<<< SEARCH" in body and ">>>>>>> REPLACE" in body:
