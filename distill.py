@@ -22,6 +22,16 @@ class Deferred(Exception):
     """Temporary API trouble (rate limit, outage): the task is NOT marked failed and is retried on the next run."""
 
 
+class QuotaExhausted(Deferred):
+    """Daily/account request quota used up: retrying now is pointless, so the whole run stops."""
+
+
+STOP = threading.Event()
+# Routers like 9router wrap upstream 402/429 billing errors in a 503, so match on the message, not just the code.
+_QUOTA_MARKERS = ("free_model_rate_limit", "24-hour", "daily limit", "quota", "insufficient", "balance",
+                  "exhausted", "recharge", "usage credits", "[402]")
+
+
 class AdaptiveLimiter:
     """Caps in-flight requests. A 429 lowers the cap by one (at most every 15s); a streak of successes raises it."""
 
@@ -67,10 +77,11 @@ _SHOWN_429 = threading.Event()
 
 
 def chat(base_url: str, api_key: str, model: str, messages: list[dict], effort: str, max_tokens: int, timeout: float,
-         max_wait: float = 1800.0) -> dict:
-    body = {"model": model, "messages": messages, "max_tokens": max_tokens}
+         max_wait: float = 1800.0, extra: dict | None = None) -> dict:
+    body = {"model": model, "messages": messages, "max_tokens": max_tokens, "stream": False}
     if effort:
         body["reasoning_effort"] = effort
+    body.update(extra or {})
     data = json.dumps(body).encode("utf-8")
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     waited, attempt = 0.0, 0
@@ -87,6 +98,11 @@ def chat(base_url: str, api_key: str, model: str, messages: list[dict], effort: 
                 code, detail = e.code, e.read().decode("utf-8", "replace")[:400]
             except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
                 code, detail = "network", str(e)
+        if code in (402, 429, 503) and any(m in detail.lower() for m in _QUOTA_MARKERS):
+            if not STOP.is_set():
+                STOP.set()
+                print(f"\n  [quota] The API's request quota is used up, stopping the run:\n  {detail[:400]}\n", flush=True)
+            raise QuotaExhausted("request quota used up")
         if code == 429:
             LIMITER.throttled()
             if not _SHOWN_429.is_set():
@@ -117,7 +133,8 @@ def solve(task: dict, model: str, args) -> dict:
     messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": task["prompt"]}]
     t0 = time.time()
     try:
-        resp = chat(args.base_url, args.api_key, model, messages, args.effort, args.max_tokens, args.timeout)
+        resp = chat(args.base_url, args.api_key, model, messages, args.effort, args.max_tokens, args.timeout,
+                    args.max_wait, getattr(args, "extra", None))
         reasoning, answer, finish = split_reply(resp)
     except Deferred as e:
         return {"ok": False, "deferred": True, "why": str(e), "model": model}
@@ -152,8 +169,10 @@ def solve(task: dict, model: str, args) -> dict:
 
 def run_task(task: dict, args) -> dict:
     tries = [args.model] * args.samples + ([args.fallback_model] if args.fallback_model else [])
-    last = {}
+    last = {"ok": False, "deferred": True, "why": "run stopped (quota used up)", "model": ""}
     for model in tries:
+        if STOP.is_set():
+            return last
         last = solve(task, model, args)
         if last["ok"] or last.get("deferred"):  # don't burn the fallback on a rate limit
             return last
@@ -178,10 +197,14 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="only the first N pending tasks (0 = all)")
     ap.add_argument("--retry-failed", action="store_true", help="also retry tasks listed in <out>.failed.jsonl")
     ap.add_argument("--base-url", default="https://api.onysoft.com/v1")
+    ap.add_argument("--api-key", default="", help="API key (overrides --api-key-env)")
+    ap.add_argument("--api-key-env", default="ONYSOFT_API_KEY", help="environment variable holding the API key")
+    ap.add_argument("--extra-body", default="", help='extra JSON merged into each request, e.g. \'{"thinking": {"type": "enabled"}}\'')
     args = ap.parse_args()
-    args.api_key = os.environ.get("ONYSOFT_API_KEY", "")
+    args.extra = json.loads(args.extra_body) if args.extra_body else {}
+    args.api_key = args.api_key or os.environ.get(args.api_key_env, "")
     if not args.api_key:
-        raise SystemExit('Set your key first:  $env:ONYSOFT_API_KEY="sk-ony-..."')
+        raise SystemExit(f'Pass --api-key, or set your key first:  $env:{args.api_key_env}="..."')
 
     with open(args.data, encoding="utf-8") as f:
         tasks = [json.loads(l) for l in f if l.strip()]
@@ -246,7 +269,9 @@ def main():
     print(f"\nKept {stats['ok']}/{total} verified traces -> {args.out}   by teacher: {stats['by_teacher']}")
     if stats["fail"]:
         print(f"Failures logged to {failed_path} (rerun with --retry-failed to try them again)")
-    if stats["deferred"]:
+    if STOP.is_set():
+        print("Stopped early: the API's request quota is used up. Rerun the same command after it resets.")
+    elif stats["deferred"]:
         print(f"{stats['deferred']} task(s) hit rate limits/outages; just run the same command again to finish them.")
 
 
