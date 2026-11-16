@@ -91,7 +91,7 @@ def build_self_destruct_script(
     # vLLM server for synth/eval; tensor-parallel across every GPU on the VM (e.g. 2x A16 for a 9B in bf16).
     vllm_block = (
         'TP="$(nvidia-smi -L | wc -l)"\n'
-        f'nohup uv run vllm serve "{base_model}" --port 8000 --max-model-len 12288 --gpu-memory-utilization 0.90 '
+        f'nohup uv run vllm serve "{base_model}" --port 8000 --max-model-len 12288 --gpu-memory-utilization 0.90 --max-num-seqs 64 '
         '--tensor-parallel-size "$TP" --reasoning-parser qwen3 > /var/log/vllm.log 2>&1 &\n'
         "for i in $(seq 1 90); do curl -sf localhost:8000/v1/models >/dev/null && break; sleep 10; done\n"
         'curl -sf localhost:8000/v1/models >/dev/null || { echo "[NeutronAI] vLLM did not start:"; tail -80 /var/log/vllm.log; exit 1; }\n'
