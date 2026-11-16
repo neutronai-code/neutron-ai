@@ -429,6 +429,14 @@ def main():
     if args.push_hf:
         try:
             model.push_to_hub_merged(args.push_hf, tokenizer, save_method="merged_16bit")
+            if vision:  # vLLM needs the base model's processor files even for text-only use
+                try:
+                    from hf_processor import copy_processor_files
+
+                    copy_processor_files(args.model, args.push_hf)
+                except Exception as e:
+                    print(f"[NeutronAI] Could not copy processor files ({e}); fix with "
+                          f"`uv run --with huggingface_hub hf_processor.py {args.model} {args.push_hf}`", flush=True)
         except Exception as e:  # never lose a finished run: at least upload the LoRA adapter
             print(f"[NeutronAI] Merged upload failed ({e}); uploading the LoRA adapter instead.", flush=True)
             from huggingface_hub import HfApi
