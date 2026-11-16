@@ -52,8 +52,13 @@ def build_self_destruct_script(
     hf_repo: str,
     auto_destroy: bool = True,
     train_args: str = "",
+    job: str = "grpo",
 ) -> str:
-    """Bash startup script with `trap cleanup EXIT` that uploads run logs & destroys its own Vultr VM even on crash."""
+    """Bash startup script with `trap cleanup EXIT` that uploads run logs & destroys its own Vultr VM even on crash.
+
+    job="grpo": train.py GRPO run, model pushed to the HF model repo `hf_repo`.
+    job="synth": serve `base_model` with vLLM, run synthesize.py over `dataset` (difficulty filter + verified traces),
+                 and upload the results to the HF *dataset* repo `hf_repo` - even if it crashes or times out."""
     log_upload_block = (
         f'  if [ -n "${{HF_TOKEN:-}}" ] && [ -f /var/log/neutron-train.log ]; then\n'
         f'    python3 -c "import os, urllib.request; '\
@@ -65,6 +70,34 @@ def build_self_destruct_script(
         if hf_repo
         else ""
     )
+    if job == "synth" and hf_repo:
+        hf_up = '"$HOME/.local/bin/uvx" --from huggingface_hub hf upload'
+        log_upload_block = (
+            '  if [ -n "${HF_TOKEN:-}" ]; then\n'
+            "    for f in sft_verified.jsonl rl_curriculum.jsonl synth_log.jsonl; do\n"
+            f'      if [ -f "/workspace/neutron-ai/$f" ]; then {hf_up} "{hf_repo}" "/workspace/neutron-ai/$f" "$f" '
+            '--repo-type dataset --token "$HF_TOKEN" || true; fi\n'
+            "    done\n"
+            f'    {hf_up} "{hf_repo}" /var/log/neutron-train.log synth-run.log --repo-type dataset --token "$HF_TOKEN" >/dev/null 2>&1 || true\n'
+            "  fi\n"
+        )
+    if job == "synth":
+        synth_minutes = max(10, max_minutes - 30)  # leave time for installs, model download and the uploads
+        job_block = (
+            f'nohup uv run vllm serve "{base_model}" --port 8000 --max-model-len 12288 --gpu-memory-utilization 0.90 '
+            "--reasoning-parser qwen3 > /var/log/vllm.log 2>&1 &\n"
+            "for i in $(seq 1 90); do curl -sf localhost:8000/v1/models >/dev/null && break; sleep 10; done\n"
+            'curl -sf localhost:8000/v1/models >/dev/null || { echo "[NeutronAI] vLLM did not start:"; tail -80 /var/log/vllm.log; exit 1; }\n'
+            f'uv run synthesize.py --data "{dataset}" --url http://localhost:8000/v1/chat/completions --model "{base_model}" '
+            f"--samples 4 --workers 32 --max-tokens 6144 --timeout 1800 --thinking on --log synth_log.jsonl "
+            f"--max-minutes {synth_minutes} {train_args}\n"
+        )
+    else:
+        hf_flag = f'--push-hf "{hf_repo}"' if hf_repo else ""
+        job_block = (
+            f'uv run train.py --mode grpo --model "{base_model}" --data "{dataset}" '
+            f"--steps {steps} --max-minutes {max_minutes} --export-gguf {hf_flag} --out hadron-out {train_args}\n"
+        )
     destroy_block = (
         '  if [ -n "${VULTR_API_KEY:-}" ] && [ -n "${VULTR_INSTANCE_ID:-}" ]; then\n'
         '    echo "[NeutronAI] Triggering Vultr API self-destruct for instance ${VULTR_INSTANCE_ID}..."\n'
@@ -74,7 +107,6 @@ def build_self_destruct_script(
         if auto_destroy
         else '  echo "[NeutronAI] auto_destroy disabled; remember to DELETE instance manually!"\n'
     )
-    hf_flag = f'--push-hf "{hf_repo}"' if hf_repo else ""
     return (
         "#!/usr/bin/env bash\n"
         "exec > >(tee -a /var/log/neutron-train.log) 2>&1\n"
@@ -106,8 +138,7 @@ def build_self_destruct_script(
         "mkdir -p /workspace && cd /workspace\n"
         f'git clone "{repo_url}" neutron-ai && cd neutron-ai\n\n'
         "uv sync --extra train\n"
-        f'uv run train.py --mode grpo --model "{base_model}" --data "{dataset}" '
-        f"--steps {steps} --max-minutes {max_minutes} --export-gguf {hf_flag} --out hadron-out {train_args}\n"
+        f"{job_block}"
     )
 
 
@@ -149,6 +180,7 @@ def cmd_launch(args) -> dict:
         hf_repo=args.hf_repo,
         auto_destroy=not args.keep_alive,
         train_args=args.train_args,
+        job=args.job,
     )
     # Inject runtime secrets into top of cloud-init script over HTTPS only when launching
     injected = (
@@ -244,6 +276,8 @@ if __name__ == "__main__":
     ap.add_argument("--out-script", default="vultr_job.sh")
     ap.add_argument("--keep-alive", action="store_true", help="Disable automatic VM DELETE on exit")
     ap.add_argument("--train-args", default="", help='Extra train.py flags, e.g. "--max-seq-len 16384 --thinking on"')
+    ap.add_argument("--job", choices=["grpo", "synth"], default="grpo",
+                    help="grpo = train; synth = measure task difficulty with vLLM + harvest verified traces (--hf-repo is a dataset repo)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--confirm", action="store_true", help="Required to actually create a billable Vultr VM")
     ap.add_argument("--self-check", action="store_true")
@@ -258,7 +292,7 @@ if __name__ == "__main__":
     elif args.action == "launch":
         cmd_launch(args)
     else:
-        s = build_self_destruct_script(args.repo_url, args.model, args.data, args.steps, args.max_minutes, args.hf_repo, not args.keep_alive, args.train_args)
+        s = build_self_destruct_script(args.repo_url, args.model, args.data, args.steps, args.max_minutes, args.hf_repo, not args.keep_alive, args.train_args, args.job)
         with open(args.out_script, "w", encoding="utf-8", newline="\n") as f:
             f.write(s)
         print(f"Wrote self-destructing Vultr GPU job script -> {args.out_script}")

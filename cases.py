@@ -254,6 +254,10 @@ def cmd_ingest(args):
             print(f"  drop  {str(raw.get('lang', '?')):12s} {str(raw.get('topic', ''))[:28]:28s} {why[:90]}")
         elif task["id"] in seen_ids:
             rejected.append({"why": "duplicate (same prompt already kept)", "case": raw})
+        elif args.min_lines and task["kind"] not in ("repo_python", "sql") and code_lines(task.get("oracle_solution", "")) < args.min_lines:
+            why = f"too easy: reference solution has under {args.min_lines} lines of code"
+            rejected.append({"why": why, "case": raw})
+            print(f"  drop  {task['kind']:12s} {task.get('topic', '')[:28]:28s} {why}")
         else:
             seen_ids.add(task["id"])
             tasks.append(task)
@@ -288,6 +292,12 @@ def cmd_ingest(args):
         print(f"Why cases were dropped: {args.rejected}")
 
 
+def code_lines(code: str) -> int:
+    """Lines of real code: not blank, not a ``` fence, not a comment-only line."""
+    return sum(1 for ln in (code or "").splitlines()
+               if ln.strip() and not ln.strip().startswith(("```", "#", "//", "/*", "*", "--")))
+
+
 def cmd_stats(args):
     import collections
 
@@ -295,6 +305,11 @@ def cmd_stats(args):
     print(f"{args.out}: {len(kept)} verified cases")
     for kind, n in collections.Counter(t.get("kind", t.get("lang")) for t in kept).most_common():
         print(f"  {kind:14s} {n}")
+    by_source = collections.Counter((t.get("source", "?"), t.get("kind", t.get("lang"))) for t in kept)
+    if len({s for s, _ in by_source}) > 1:
+        print("\nBy source:")
+        for (src, kind), n in sorted(by_source.items()):
+            print(f"  {src:40s} {kind:14s} {n}")
     rej = load_jsonl(args.rejected)
     if rej:
         print(f"\n{args.rejected}: {len(rej)} dropped. Most common reasons:")
@@ -340,6 +355,8 @@ def main():
     i.add_argument("--rejected", default="cases_rejected.jsonl")
     i.add_argument("--dedupe-against", default="train_clean.jsonl,tasks.jsonl")
     i.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 1))
+    i.add_argument("--min-lines", type=int, default=0,
+                   help="drop cases whose reference solution has fewer lines of code (not applied to sql/repo_python)")
     args = ap.parse_args()
 
     if args.cmd == "prompt":
