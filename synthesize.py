@@ -13,7 +13,7 @@ GPU (vLLM):       uv run synthesize.py --data tasks_generated.jsonl --url http:/
                     --model Qwen/Qwen3.5-4B --workers 32 --max-tokens 6144 --thinking on
 """
 import argparse, collections, concurrent.futures, json, os, threading, time, urllib.error, urllib.request
-from repair import system_prompt_for
+from repair import system_prompt_for, task_prompt
 from sandbox import verify
 
 
@@ -99,7 +99,7 @@ def finalize(tasks: list[dict], log_path: str, sft_out: str, rl_out: str) -> tup
                 "id": t.get("id", ""),
                 "messages": [
                     {"role": "system", "content": system_prompt_for(t)},
-                    {"role": "user", "content": t["prompt"]},
+                    {"role": "user", "content": task_prompt(t)},
                     {"role": "assistant", "content": r["best"]},
                 ],
             })
@@ -158,7 +158,7 @@ def run_engine(tasks_path: str, sft_out: str, rl_out: str, url: str, model: str,
         else:
             sys_prompt = system_prompt_for(t)
             metas = [{} for _ in range(samples)]
-            candidates = [_sample_with_retry(url, model, sys_prompt, t["prompt"], api_key, temperature,
+            candidates = [_sample_with_retry(url, model, sys_prompt, task_prompt(t), api_key, temperature,
                                              max_tokens=max_tokens, timeout=timeout, thinking=thinking, meta=m)
                           for m in metas]
             if any(c is None for c in candidates):  # server trouble: don't record a fake 0%, retry on resume

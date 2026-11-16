@@ -18,7 +18,7 @@ Usage:
   uv run fim.py --self-check
   uv run fim.py mine --out fim_tasks.jsonl
 """
-import argparse, ast, json, re, urllib.request
+import argparse, ast, collections, concurrent.futures, json, random, re, urllib.error, urllib.request
 from repomap import extract_file_skeleton, graph_neighbors
 from sandbox import CODE_BLOCK, strip_think, verify
 
@@ -72,7 +72,8 @@ def verify_fim(
         merged_files = {**repo_files, target_path: assembled}
         noop_patch = f"### FILE: {target_path}\n<<<<<<< SEARCH\n{assembled}\n=======\n{assembled}\n>>>>>>> REPLACE"
         return verify(noop_patch, test_code, files=merged_files, lang=lang, timeout=timeout)
-    fenced = f"```{lang}\n{assembled}\n```"
+    fence = {"python_stdio": "python", "stdio": "python"}.get(lang, lang)  # CODE_BLOCK only knows real language tags
+    fenced = f"```{fence}\n{assembled}\n```"
     return verify(fenced, test_code, lang=lang, timeout=timeout)
 
 
@@ -97,44 +98,76 @@ def fim_grpo_reward_func(completions, prefix, suffix, test, lang=None, repo_file
     return scores
 
 
-def mine_fim_tasks_from_python(task_id: str, clean_code: str, test_code: str, max_spans: int = 3) -> list[dict]:
+def mine_fim_tasks_from_python(task_id: str, clean_code: str, test_code: str, max_spans: int = 3,
+                               lang: str = "python", shuffle_seed: str = "") -> list[dict]:
     """Carve AST-aligned `Return`, `Assign`, and loop/branch bodies into verified FIM tasks."""
     lines = clean_code.splitlines(keepends=True)
     tree = ast.parse(clean_code)
     spans = []
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Return, ast.Assign, ast.AugAssign, ast.For, ast.While)) and hasattr(node, "lineno") and hasattr(node, "end_lineno"):
+        if isinstance(node, (ast.Return, ast.Assign, ast.AugAssign, ast.For, ast.While, ast.If)) and hasattr(node, "lineno") and hasattr(node, "end_lineno"):
             lo, hi = node.lineno - 1, node.end_lineno
             if 0 <= lo < hi <= len(lines) and (hi - lo) <= 6:
                 spans.append((lo, hi))
+    if shuffle_seed:  # vary which spans get picked (deterministically per case) instead of always the first ones
+        random.Random(shuffle_seed).shuffle(spans)
+    return _verified_fim_tasks(task_id, lines, spans, test_code, lang, "    pass", max_spans)
 
-    # Deduplicate & prefer inner meaty spans
-    seen, tasks = set(), []
+
+def mine_fim_tasks_from_lines(task_id: str, code: str, test_code: str, lang: str, max_spans: int = 2,
+                              shuffle_seed: str = "") -> list[dict]:
+    """Brace languages (JS/TS/C++): carve 1-4 consecutive indented statement lines whose braces balance."""
+    lines = code.splitlines(keepends=True)
+    ok_line = [
+        bool(ln.strip()) and ln[:1] in (" ", "\t") and ln.strip() not in ("{", "}", "};", "});", ")")
+        and not ln.strip().startswith(("//", "/*", "*", "#"))
+        for ln in lines
+    ]
+    spans = []
+    for lo in range(len(lines)):
+        for size in (1, 2, 3, 4):
+            hi = lo + size
+            if hi > len(lines) or not all(ok_line[lo:hi]):
+                break
+            chunk = "".join(lines[lo:hi])
+            if chunk.count("{") == chunk.count("}") and chunk.count("(") == chunk.count(")"):
+                spans.append((lo, hi))
+    random.Random(shuffle_seed or task_id).shuffle(spans)
+    return _verified_fim_tasks(task_id, lines, spans, test_code, lang, "/* TODO */", max_spans)
+
+
+def _verified_fim_tasks(task_id: str, lines: list[str], spans: list[tuple[int, int]], test_code: str, lang: str,
+                        hole: str, max_spans: int) -> list[dict]:
+    """Keep spans where the spliced oracle passes AND a blank hole fails (so the middle really matters)."""
+    seen, tasks, original_ok = set(), [], None
     for lo, hi in spans:
-        if (lo, hi) in seen:
+        if (lo, hi) in seen or any(lo < h and l < hi for l, h in seen):  # no overlapping holes per case
             continue
-        seen.add((lo, hi))
         prefix = "".join(lines[:lo])
         oracle_mid = "".join(lines[lo:hi]).rstrip("\r\n")
         suffix = "\n" + "".join(lines[hi:])
         if not oracle_mid.strip():
             continue
-        # Confirm spliced oracle passes 100% AND blank hole fails!
-        ok_score, _ = verify_fim(oracle_mid, prefix, suffix, test_code)
-        hole_score, _ = verify_fim("    pass", prefix, suffix, test_code)
-        if ok_score == 1.0 and hole_score < 1.0:
-            tasks.append({
-                "id": f"fim_{task_id}_L{lo+1}",
-                "category": "fim",
-                "lang": "python",
-                "prefix": prefix,
-                "suffix": suffix,
-                "fim_prompt": format_qwen_fim_prompt(prefix, suffix),
-                "oracle_middle": oracle_mid,
-                "test": test_code,
-            })
-            if len(tasks) >= max_spans:
-                break
+        if original_ok is None:  # splicing the oracle back rebuilds the original file, so check that only once
+            original_ok = verify_fim(oracle_mid, prefix, suffix, test_code, lang=lang)[0] == 1.0
+        if not original_ok:
+            return []
+        hole_score, _ = verify_fim(hole, prefix, suffix, test_code, lang=lang)
+        if hole_score >= 1.0:
+            continue
+        seen.add((lo, hi))
+        tasks.append({
+            "id": f"fim_{task_id}_L{lo+1}",
+            "category": "fim",
+            "lang": lang,
+            "prefix": prefix,
+            "suffix": suffix,
+            "fim_prompt": format_qwen_fim_prompt(prefix, suffix),
+            "oracle_middle": oracle_mid,
+            "test": test_code,
+        })
+        if len(tasks) >= max_spans:
+            break
     return tasks
 
 
@@ -214,18 +247,132 @@ def run_self_check():
     print(f"fim.py self-check passed: mined {len(mined_all)} AST FIM spans + verified Cross-File `<|file_sep|>` Repo-FIM & Py/TS splice.")
 
 
+# vLLM (like OpenAI) accepts at most 4 stop strings. These are special tokens, so the request also sets
+# skip_special_tokens=False: otherwise they never appear in the text and the stop strings could not match.
+FIM_STOPS = ["<|endoftext|>", "<|fim_pad|>", "<|file_sep|>", "<|fim_prefix|>"]
+
+
+def query_fim_completion(url: str, model: str, fim_prompt: str, api_key: str = "", max_tokens: int = 256) -> str:
+    """Raw FIM for base models via /v1/completions: the prompt is `<|fim_prefix|>...<|fim_suffix|>...<|fim_middle|>`."""
+    payload = json.dumps({"model": model, "prompt": fim_prompt, "max_tokens": max_tokens, "temperature": 0.0,
+                          "stop": FIM_STOPS, "skip_special_tokens": False}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read().decode("utf-8"))["choices"][0]["text"]
+    except urllib.error.HTTPError as e:  # surface the server's reason (e.g. a 400 message) instead of just the code
+        raise RuntimeError(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:300]}") from None
+
+
+def _clean_oracle(code: str) -> str:
+    m = CODE_BLOCK.findall(code or "")
+    return (m[-1] if m else code or "").strip("\n")
+
+
+def _mine_case(t: dict, max_spans: int) -> list[dict]:
+    lang, code = t.get("lang", "python"), _clean_oracle(t.get("oracle_solution", ""))
+    if not code or t.get("files") or t.get("kind") == "repo_python" or lang == "sql":
+        return []
+    try:
+        if lang in ("python", "python_stdio"):
+            return mine_fim_tasks_from_python(t["id"], code, t["test"], max_spans, lang=lang, shuffle_seed=t["id"])
+        if lang in ("javascript", "typescript", "cpp"):
+            return mine_fim_tasks_from_lines(t["id"], code, t["test"], lang, max_spans, shuffle_seed=t["id"])
+    except (SyntaxError, ValueError) as e:
+        print(f"  skip {t['id']}: {type(e).__name__}", flush=True)
+    return []
+
+
+def mine_from_cases(source: str, holdout_path: str, out: str, holdout_out: str, max_spans: int, workers: int, limit: int):
+    with open(source, encoding="utf-8") as f:
+        cases = [json.loads(l) for l in f if l.strip()]
+    if limit:
+        cases = cases[:limit]
+    held = set()
+    if holdout_path:
+        with open(holdout_path, encoding="utf-8") as f:
+            held = {json.loads(l)["id"] for l in f if l.strip()}
+    train, test, done = [], [], 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for t, mined in zip(cases, pool.map(lambda c: _mine_case(c, max_spans), cases)):
+            for m in mined:
+                m["source_case"] = t["id"]
+            (test if t["id"] in held else train).extend(mined)
+            done += 1
+            if done % 100 == 0:
+                print(f"  {done}/{len(cases)} cases -> {len(train)} train + {len(test)} held-out FIM tasks", flush=True)
+    for path, rows in ((out, train), (holdout_out, test)):
+        with open(path, "w", encoding="utf-8") as fo:
+            for r in rows:
+                fo.write(json.dumps(r) + "\n")
+    by_lang = collections.Counter(r["lang"] for r in train + test)
+    print(f"Mined {len(train)} training FIM tasks -> {out} and {len(test)} held-out -> {holdout_out} "
+          f"({', '.join(f'{k} {v}' for k, v in sorted(by_lang.items()))})")
+
+
+def eval_fim(data: str, url: str, model: str, api_key: str, mode: str, workers: int, limit: int, report: str):
+    with open(data, encoding="utf-8") as f:
+        rows = [json.loads(l) for l in f if l.strip()]
+    if limit:
+        rows = rows[:limit]
+
+    def one(r):
+        lang = r.get("lang", "python")
+        try:
+            reply = (query_fim_completion(url, model, r["fim_prompt"], api_key) if mode == "completions"
+                     else query_fim_via_chat(url, model, r["prefix"], r["suffix"], lang, api_key))
+            sc, info = verify_fim(reply, r["prefix"], r["suffix"], r["test"], lang)
+        except Exception as e:  # noqa: BLE001 - count server/verifier trouble as a miss, keep going
+            reply, sc, info = "", 0.0, {"status": f"error: {type(e).__name__}: {str(e)[:300]}"}
+        return {"id": r["id"], "lang": lang, "pass": sc == 1.0, "status": info.get("status", ""), "completion": reply}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(one, rows))
+    errors = collections.Counter(r["status"] for r in results if r["status"].startswith("error"))
+    for msg, n in errors.most_common(3):
+        print(f"  {n} requests failed: {msg}", flush=True)
+    by_lang = collections.defaultdict(list)
+    for res in results:
+        by_lang[res["lang"]].append(res["pass"])
+    print(f"\nFIM pass@1 for {model} ({mode}):")
+    for lang, ok in sorted(by_lang.items()):
+        print(f"  {lang:14s} {sum(ok):4d}/{len(ok):<4d} {sum(ok) / len(ok):.1%}")
+    total = sum(r["pass"] for r in results)
+    print(f"  {'overall':14s} {total:4d}/{len(results):<4d} {total / max(1, len(results)):.1%}")
+    if report:
+        with open(report, "w", encoding="utf-8") as fo:
+            for res in results:
+                fo.write(json.dumps(res) + "\n")
+    return total / max(1, len(results))
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("action", nargs="?", default="mine", choices=["mine", "eval"])
+    ap.add_argument("--source", default="", help="mine: verified cases file (e.g. tasks_generated.jsonl); empty = legacy tasks.jsonl")
+    ap.add_argument("--holdout", default="tasks_holdout.jsonl", help="mine: cases whose FIM tasks go to --holdout-out")
     ap.add_argument("--out", default="fim_tasks.jsonl")
+    ap.add_argument("--holdout-out", default="fim_holdout.jsonl")
+    ap.add_argument("--max-spans", type=int, default=2)
+    ap.add_argument("--data", default="", help="eval: FIM tasks file (default --out)")
+    ap.add_argument("--mode", choices=["chat", "completions"], default="chat",
+                    help="eval: chat = instruct models; completions = raw <|fim_prefix|> prompt for base models")
     ap.add_argument("--url", default="http://127.0.0.1:8080/v1/chat/completions")
     ap.add_argument("--model", default="quark-1.5b")
     ap.add_argument("--api-key", default="")
+    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--report", default="")
     ap.add_argument("--self-check", action="store_true")
     args = ap.parse_args()
 
     if args.self_check:
         run_self_check()
+    elif args.action == "mine" and args.source:
+        mine_from_cases(args.source, args.holdout, args.out, args.holdout_out, args.max_spans, args.workers, args.limit)
     elif args.action == "mine":
         from eval import MOCK_SOLUTIONS
 
@@ -241,12 +388,4 @@ if __name__ == "__main__":
                 fo.write(json.dumps(item) + "\n")
         print(f"Mined {len(out_tasks)} execution-verified FIM autocomplete tasks -> {args.out}")
     else:
-        with open(args.out, encoding="utf-8") as f:
-            fim_rows = [json.loads(l) for l in f if l.strip()]
-        wins = 0
-        for r in fim_rows:
-            reply = query_fim_via_chat(args.url, args.model, r["prefix"], r["suffix"], r.get("lang", "python"), args.api_key)
-            sc, info = verify_fim(reply, r["prefix"], r["suffix"], r["test"], r.get("lang", "python"))
-            wins += int(sc == 1.0)
-            print(f"[{r['id']:30s}] {'PASS' if sc == 1.0 else 'FAIL'} ({info['status']})")
-        print(f"\nFIM execution pass@1: {wins}/{len(fim_rows)} ({wins/max(1,len(fim_rows)):.1%})")
+        eval_fim(args.data or args.out, args.url, args.model, args.api_key, args.mode, args.workers, args.limit, args.report)

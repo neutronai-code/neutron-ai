@@ -34,10 +34,19 @@ def main():
     ap.add_argument("--unscored-out", default="",
                     help="Only write the non-held-out cases with no pass rate yet (input for another filter run), then exit")
     ap.add_argument("--source-filter", default="", help="With --unscored-out: only cases whose source contains this")
+    ap.add_argument("--exclude-source", default="", help="Leave out cases whose source contains this (e.g. 'hard')")
+    ap.add_argument("--ignore-rates-for", default="",
+                    help="Comma-separated kinds whose measured pass rates are unreliable; treat them as unmeasured")
     args = ap.parse_args()
 
     tasks = load_jsonl(args.tasks)
+    if args.exclude_source:
+        tasks = [t for t in tasks if args.exclude_source not in t.get("source", "")]
     rates = {r["key"]: r for r in load_jsonl(args.synth_log)}
+    ignored = {k.strip() for k in args.ignore_rates_for.split(",") if k.strip()}
+    if ignored:
+        unreliable = {t["id"] for t in tasks if t.get("kind", t.get("lang")) in ignored}
+        rates = {k: v for k, v in rates.items() if k not in unreliable}
     if not rates:
         print(f"Note: no pass rates found in {args.synth_log}; every case is treated as unmeasured.")
     if args.unscored_out:

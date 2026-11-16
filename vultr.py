@@ -126,6 +126,8 @@ def build_self_destruct_script(
             "timeout 1500 uv pip install --no-build-isolation causal-conv1d || true\n"
             "uv run --no-sync python kernel_check.py conv || uv pip uninstall causal-conv1d || true\n"
         )
+        if not re.search(r"qwen3[._]5", base_model, re.I):  # the kernels only speed up Qwen3.5's linear attention
+            fast_kernels = ""
         job_block = fast_kernels + (
             f'uv run --no-sync train.py --mode grpo --model "{base_model}" --data "{dataset}" '
             f"--steps {steps} --max-minutes {max_minutes} --export-gguf {hf_flag} --out hadron-out {train_args}\n"

@@ -11,8 +11,8 @@ Full NeutronAI training stack:
 Vultr Cost-Guard:
   Pass `--max-minutes 45` so a runaway hangout never drains your $300 GPU credits, and DESTROY the Vultr VM right after `--push-hf`!
 """
-import argparse, inspect, json, os, re, sys, time
-from repair import CODE_SYS, system_prompt_for
+import argparse, inspect, json, os, random, re, sys, time
+from repair import CODE_SYS, system_prompt_for, task_prompt
 from sandbox import grpo_reward_func, reasoning_format_reward_func
 
 
@@ -104,7 +104,7 @@ def load_rl_dataset(source: str, render=None, tokenizer=None, max_prompt_tokens:
     if tokenizer is not None and max_prompt_tokens and render is not None:
         # TRL may ignore max_prompt_length; drop overlong prompts so a long repo task can't OOM the GPU.
         def n_tokens(r):
-            text = render([{"role": "system", "content": system_prompt_for(r)}, {"role": "user", "content": r["prompt"]}])
+            text = render([{"role": "system", "content": system_prompt_for(r)}, {"role": "user", "content": task_prompt(r)}])
             return len(tokenizer(text, add_special_tokens=False)["input_ids"])
 
         before = len(rows)
@@ -115,7 +115,7 @@ def load_rl_dataset(source: str, render=None, tokenizer=None, max_prompt_tokens:
         {
             "prompt": fmt([
                 {"role": "system", "content": system_prompt_for(r)},
-                {"role": "user", "content": r["prompt"]},
+                {"role": "user", "content": task_prompt(r)},
             ]),
             "test": r["test"],
             "starter_code": r.get("starter_code", ""),
@@ -223,6 +223,8 @@ def main():
                     help="Continue from the latest checkpoint (local, else <--push-hf>/last-checkpoint on the Hub)")
     ap.add_argument("--save-steps", type=int, default=0, help="Checkpoint every N steps (0 = auto, at most 50)")
     ap.add_argument("--max-prompt-tokens", type=int, default=1024, help="Drop RL tasks whose prompt is longer")
+    ap.add_argument("--fim-format", choices=["auto", "raw", "chat"], default="auto",
+                    help="fim-grpo prompts: raw <|fim_prefix|> string (base models) or chat-wrapped; auto = raw unless Instruct")
     ap.add_argument("--export-gguf", action="store_true")
     ap.add_argument("--push-hf", default="")
     ap.add_argument("--out", default="hadron-v0.9")
@@ -387,10 +389,21 @@ def main():
 
             with open(args.data, encoding="utf-8") as f:
                 fim_rows = [json.loads(l) for l in f if l.strip()]
+            if args.max_prompt_tokens:  # ~3.5 chars per code token; skip whole files too long for the prompt budget
+                before = len(fim_rows)
+                fim_rows = [r for r in fim_rows if len(r.get("fim_prompt", "")) <= args.max_prompt_tokens * 3.5]
+                print(f"[NeutronAI] FIM tasks: {len(fim_rows)} (dropped {before - len(fim_rows)} with long prompts)", flush=True)
+            # No measured difficulty for FIM tasks, and the file is grouped by language: mix it (fixed seed, so
+            # --resume sees the same order) since shuffle_dataset is off to keep Hadron's curriculum order.
+            random.Random(42).shuffle(fim_rows)
             fmt = render or (lambda messages: messages)
+            # Base FIM models (Qwen2.5-Coder-1.5B etc.) are trained on the raw `<|fim_prefix|>...<|fim_middle|>` string,
+            # exactly what an editor sends at the cursor; chat-wrapping it would train a format nobody will use.
+            raw_fim = args.fim_format == "raw" or (args.fim_format == "auto" and "instruct" not in args.model.lower())
+            print(f"[NeutronAI] FIM prompt format: {'raw <|fim_prefix|>' if raw_fim else 'chat'}", flush=True)
             fim_ds = Dataset.from_list([
                 {
-                    "prompt": fmt([
+                    "prompt": r["fim_prompt"] if raw_fim else fmt([
                         {"role": "system", "content": f"Complete ONLY the missing `{r.get('lang', 'python')}` code between <PREFIX> and <SUFFIX> inside a fenced block."},
                         {"role": "user", "content": r.get("fim_prompt") or f"<PREFIX>\n{r['prefix']}</PREFIX>\n<SUFFIX>\n{r['suffix']}</SUFFIX>"},
                     ]),

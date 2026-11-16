@@ -12,7 +12,7 @@ Examples:
 """
 import argparse, collections, concurrent.futures, json, math, urllib.request
 import repair
-from repair import solve_with_repair, system_prompt_for
+from repair import solve_with_repair, system_prompt_for, task_prompt
 from sandbox import verify
 
 MOCK_SOLUTIONS = {
@@ -113,7 +113,7 @@ def eval_single_task(task: dict, url: str, model: str, api_key: str, n: int, rep
             last = rep["attempts"][-1]
             score, info = last["reward"], last["info"]
         else:
-            sol = MOCK_SOLUTIONS.get(task.get("id", ""), "") if mock else query_endpoint(url, model, sys_prompt, task["prompt"], api_key, temp)
+            sol = MOCK_SOLUTIONS.get(task.get("id", ""), "") if mock else query_endpoint(url, model, sys_prompt, task_prompt(task), api_key, temp)
             score, info = verify(
                 sol,
                 task["test"],

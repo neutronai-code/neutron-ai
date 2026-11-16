@@ -31,6 +31,31 @@ REPO_SYS = (
 )
 
 
+_FENCE_BY_EXT = {".py": "python", ".js": "javascript", ".mjs": "javascript", ".ts": "typescript", ".sql": "sql",
+                 ".cpp": "cpp", ".h": "cpp", ".hpp": "cpp", ".json": "json"}
+
+
+def task_prompt(task: dict) -> str:
+    """The user prompt a model should see. Repo tasks written by cases.py keep their files only in `files`, not in the
+    prompt text, so append any file the prompt doesn't already show (`### FILE: path` + fenced contents). Without
+    this a model is asked to patch code it cannot see (every such case scored 0)."""
+    prompt = task["prompt"]
+    files = task.get("files")
+    if isinstance(files, str):
+        files = json.loads(files) if files else None
+    if not files:
+        return prompt
+    # Empty files (package __init__.py) add nothing, and skipping them keeps tasks.jsonl prompts byte-identical.
+    missing = [p for p in files if files[p].strip() and f"### FILE: {p}\n" not in prompt]
+    if not missing:
+        return prompt
+    blocks = []
+    for path in missing:
+        ext = path[path.rfind("."):] if "." in path else ""
+        blocks.append(f"### FILE: {path}\n```{_FENCE_BY_EXT.get(ext, '')}\n{files[path].rstrip()}\n```")
+    return prompt.rstrip() + "\n\nRepository files:\n\n" + "\n\n".join(blocks)
+
+
 def system_prompt_for(task: dict) -> str:
     if task.get("files"):
         return REPO_SYS
@@ -72,7 +97,7 @@ def solve_with_repair(
     sys_prompt = system_prompt_for(task)
     messages = [
         {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": task["prompt"]},
+        {"role": "user", "content": task_prompt(task)},
     ]
     attempts = []
     for turn in range(1, max_turns + 1):
