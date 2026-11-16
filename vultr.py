@@ -212,15 +212,15 @@ def cmd_status(api_key: str):
 def run_self_check():
     script = build_self_destruct_script(
         repo_url="https://github.com/neutron-ai/neutron.git",
-        base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+        base_model="Qwen/Qwen3.5-4B",
         dataset="mbpp",
         steps=300,
         max_minutes=60,
-        hf_repo="NeutronAI/Hadron-7B-v0.9",
+        hf_repo="neutronai-code/Hadron-4B-v0.1",
     )
     assert "trap cleanup EXIT" in script, script
     assert "DELETE \"https://api.vultr.com/v2/instances/${VULTR_INSTANCE_ID}\"" in script, script
-    assert "--max-minutes 60" in script and "--push-hf \"NeutronAI/Hadron-7B-v0.9\"" in script, script
+    assert "--max-minutes 60" in script and "--push-hf \"neutronai-code/Hadron-4B-v0.1\"" in script, script
     assert "169.254.169.254/v1/instance-v2-id" in script, script
     print("vultr.py (NeutronAI) self-check passed: cloud-init script verified with metadata ID discovery + trap EXIT self-destruct.")
 
@@ -230,13 +230,13 @@ if __name__ == "__main__":
     ap.add_argument("action", nargs="?", default="script", choices=["plans", "script", "launch", "status"])
     ap.add_argument("--api-key", default=os.environ.get("VULTR_API_KEY", ""))
     ap.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""))
-    ap.add_argument("--plan", default="vcg-a100-1c-6g-16vram")
+    ap.add_argument("--plan", default="vcg-a16-6c-60g-16vram")
     ap.add_argument("--region", default="ewr")
     ap.add_argument("--os-id", type=int, default=2284, help="Vultr OS ID (2284 = Ubuntu 24.04 x64; Vultr auto-installs GPU drivers on vcg-* plans)")
     ap.add_argument("--image-id", default="", help="Optional Vultr Marketplace image_id")
     ap.add_argument("--label", default="neutron-hadron-rlvr")
     ap.add_argument("--repo-url", default="")
-    ap.add_argument("--model", default="Qwen/Qwen2.5-Coder-7B-Instruct")
+    ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
     ap.add_argument("--data", default="mbpp")
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--max-minutes", type=int, default=60)

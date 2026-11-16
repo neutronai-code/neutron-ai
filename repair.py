@@ -48,13 +48,16 @@ def system_prompt_for(task: dict) -> str:
     return CODE_SYS
 
 
+REQUEST_TIMEOUT = 180  # seconds per model reply; eval.py --timeout overrides it
+
+
 def chat_completion(url: str, model: str, messages: list[dict], api_key: str, temperature: float = 0.2) -> str:
     payload = json.dumps({"model": model, "temperature": temperature, "messages": messages}).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=180) as resp:
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
         return json.loads(resp.read().decode("utf-8"))["choices"][0]["message"]["content"]
 
 

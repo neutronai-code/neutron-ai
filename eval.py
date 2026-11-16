@@ -11,6 +11,7 @@ Examples:
   uv run eval.py --url http://localhost:11434/v1/chat/completions --model hadron-7b --compare base.jsonl
 """
 import argparse, collections, concurrent.futures, json, math, urllib.request
+import repair
 from repair import solve_with_repair, system_prompt_for
 from sandbox import verify
 
@@ -93,7 +94,7 @@ def query_endpoint(url: str, model: str, sys_prompt: str, prompt: str, api_key: 
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=180) as resp:
+    with urllib.request.urlopen(req, timeout=repair.REQUEST_TIMEOUT) as resp:
         return json.loads(resp.read().decode("utf-8"))["choices"][0]["message"]["content"]
 
 
@@ -162,6 +163,9 @@ def run_eval(data_path: str, url: str, model: str, api_key: str, n: int, ks: lis
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futs = [pool.submit(eval_single_task, t, url, model, api_key, n, repair_turns, mock) for t in tasks]
+        for done, fut in enumerate(concurrent.futures.as_completed(futs), 1):
+            r = fut.result()
+            print(f"  progress {done}/{len(tasks)}: {r['id']} -> {r['c']}/{r['n']} passed", flush=True)
         results = [f.result() for f in futs]
 
     by_cat = collections.defaultdict(list)
@@ -196,11 +200,13 @@ if __name__ == "__main__":
     ap.add_argument("--n", type=int, default=1)
     ap.add_argument("--k", default="1")
     ap.add_argument("--repair-turns", type=int, default=1, help="Set to 2-3 to evaluate multi-turn test-guided self-repair")
-    ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--workers", type=int, default=6, help="Tasks sent at once; use 1 for a local CPU model (Ollama)")
+    ap.add_argument("--timeout", type=float, default=180, help="Seconds to wait for each model reply; raise it (e.g. 1800) for slow local models")
     ap.add_argument("--report", default="eval_report.jsonl")
     ap.add_argument("--compare", default="", help="Previous eval_report.jsonl to diff against")
     ap.add_argument("--mock", action="store_true")
     args = ap.parse_args()
+    repair.REQUEST_TIMEOUT = args.timeout
     ks = [int(x) for x in args.k.split(",") if x.strip()]
     summary = run_eval(args.data, args.url, args.model, args.api_key, args.n, ks, args.repair_turns, args.workers, args.report, args.compare, args.mock)
     if args.mock:

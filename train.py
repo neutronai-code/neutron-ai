@@ -11,7 +11,7 @@ Full NeutronAI training stack:
 Vultr Cost-Guard:
   Pass `--max-minutes 45` so a runaway hangout never drains your $300 GPU credits, and DESTROY the Vultr VM right after `--push-hf`!
 """
-import argparse, inspect, json, time
+import argparse, inspect, json, re, sys, time
 from repair import CODE_SYS, system_prompt_for
 from sandbox import grpo_reward_func, reasoning_format_reward_func
 
@@ -26,6 +26,32 @@ def is_vision_model(model_name: str) -> bool:
         return False
     archs = getattr(cfg, "architectures", None) or []
     return hasattr(cfg, "vision_config") or any(a.endswith("ForConditionalGeneration") for a in archs)
+
+
+def is_qwen35(model_name: str) -> bool:
+    """Qwen3.5 (Gated DeltaNet hybrid). Unsloth: 4-bit QLoRA hurts these models more than usual, so train in bf16."""
+    return bool(re.search(r"qwen3[._]5", model_name, re.I))
+
+
+def model_billions(model_name: str) -> float:
+    """Parameter count from the name, e.g. 'Qwen/Qwen3.5-4B' -> 4.0 (0 if the name doesn't say)."""
+    m = re.search(r"(\d+(?:\.\d+)?)B(?![a-z])", model_name.split("/")[-1], re.I)
+    return float(m.group(1)) if m else 0.0
+
+
+def hf_preflight(repo_id: str):
+    """Create (or confirm write access to) the HF repo BEFORE training, so a bad name or token fails in minute one
+    instead of after hours of paid GPU time."""
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    try:
+        user = api.whoami()["name"]
+        api.create_repo(repo_id, exist_ok=True)
+    except Exception as e:
+        sys.exit(f"[NeutronAI] Can't write to Hugging Face repo '{repo_id}': {e}\n"
+                 f"Check HF_TOKEN has write access and the namespace is yours (e.g. neutronai-code/...).")
+    print(f"[NeutronAI] HF upload target OK: {repo_id} (logged in as {user})", flush=True)
 
 
 def make_prompt_renderer(tokenizer, thinking: str, max_completion: int):
@@ -145,6 +171,8 @@ def main():
     ap.add_argument("--load-in-4bit", choices=["auto", "yes", "no"], default="auto",
                     help="auto = 4-bit below 40GB VRAM, bf16 on bigger GPUs (A100 80GB)")
     args = ap.parse_args()
+    if args.push_hf:
+        hf_preflight(args.push_hf)
 
     # ponytail: single-GPU Unsloth handles 1.5B-32B; upgrade to multi-node verl/OpenRLHF when funded past 1x H100.
     import torch
@@ -156,6 +184,16 @@ def main():
     if vram_gb > 0 and vram_gb < 22.0 and args.num_generations > 4:
         args.num_generations = 4
     load_4bit = args.load_in_4bit == "yes" or (args.load_in_4bit == "auto" and vram_gb < 40.0)
+    if is_qwen35(args.model) and args.load_in_4bit != "yes":
+        # Qwen3.5 must train in bf16. Refuse early if the weights clearly won't fit, instead of silently degrading.
+        load_4bit = False
+        need_gb = model_billions(args.model) * 2.3 + 4.0  # bf16 weights (+vision tower) + LoRA/activation headroom
+        if vram_gb and need_gb > vram_gb:
+            sys.exit(f"[NeutronAI] {args.model} needs ~{need_gb:.0f}GB VRAM in bf16 but this GPU has {vram_gb:.0f}GB. "
+                     f"Unsloth advises against 4-bit training for Qwen3.5. Use a smaller model (Qwen/Qwen3.5-4B), "
+                     f"a bigger GPU, or force it with --load-in-4bit yes.")
+    elif is_qwen35(args.model) and load_4bit:
+        print("[NeutronAI] WARNING: Unsloth advises against 4-bit training on Qwen3.5 (quality loss).", flush=True)
     vision = is_vision_model(args.model)
     print(f"[NeutronAI] model={args.model} vision_arch={vision} vram={vram_gb:.0f}GB 4bit={load_4bit} vllm={use_vllm}", flush=True)
 
@@ -319,9 +357,18 @@ def main():
     tokenizer.save_pretrained(args.out)
 
     if args.push_hf:
-        model.push_to_hub_merged(args.push_hf, tokenizer, save_method="merged_16bit")
+        try:
+            model.push_to_hub_merged(args.push_hf, tokenizer, save_method="merged_16bit")
+        except Exception as e:  # never lose a finished run: at least upload the LoRA adapter
+            print(f"[NeutronAI] Merged upload failed ({e}); uploading the LoRA adapter instead.", flush=True)
+            from huggingface_hub import HfApi
+
+            HfApi().upload_folder(repo_id=args.push_hf, folder_path=args.out, path_in_repo="lora_adapter")
         if args.export_gguf:
-            model.push_to_hub_gguf(f"{args.push_hf}-GGUF", tokenizer, quantization_method="q4_k_m")
+            try:
+                model.push_to_hub_gguf(f"{args.push_hf}-GGUF", tokenizer, quantization_method="q4_k_m")
+            except Exception as e:
+                print(f"[NeutronAI] GGUF export/upload failed ({e}); the bf16 model is already uploaded.", flush=True)
     elif args.export_gguf:
         model.save_pretrained_gguf(f"{args.out}-gguf", tokenizer, quantization_method="q4_k_m")
     print(f"Finished {args.mode.upper()} -> {args.out}")
