@@ -73,15 +73,17 @@ def build_self_destruct_script(
     if job in ("synth", "eval") and hf_repo:
         hf_up = '"$HOME/.local/bin/uvx" --from huggingface_hub hf upload'
         tag = re.sub(r"[^A-Za-z0-9._-]+", "_", base_model.split("/")[-1])
-        uploads = ([("sft_verified.jsonl", "sft_verified.jsonl"), ("rl_curriculum.jsonl", "rl_curriculum.jsonl"),
-                    ("synth_log.jsonl", "synth_log.jsonl")] if job == "synth"
+        # Each filter run gets its own folder (named after its data file), so runs never overwrite each other.
+        synth_dir = "synth/" + re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.splitext(os.path.basename(dataset))[0])
+        uploads = ([(f, f"{synth_dir}/{f}") for f in ("sft_verified.jsonl", "rl_curriculum.jsonl", "synth_log.jsonl")]
+                   if job == "synth"
                    else [("eval_report.jsonl", f"eval/{tag}.jsonl"), ("eval_summary.txt", f"eval/{tag}.txt")])
         lines = "".join(
             f'    if [ -f "/workspace/neutron-ai/{src}" ]; then {hf_up} "{hf_repo}" "/workspace/neutron-ai/{src}" "{dst}" '
             f'--repo-type dataset --token "$HF_TOKEN" || true; fi\n'
             for src, dst in uploads
         )
-        run_log = "synth-run.log" if job == "synth" else f"eval/{tag}-run.log"
+        run_log = f"{synth_dir}/run.log" if job == "synth" else f"eval/{tag}-run.log"
         log_upload_block = (
             '  if [ -n "${HF_TOKEN:-}" ]; then\n'
             f"{lines}"

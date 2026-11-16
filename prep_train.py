@@ -31,12 +31,25 @@ def main():
     ap.add_argument("--train-out", default="train_rl.jsonl")
     ap.add_argument("--holdout-out", default="tasks_holdout.jsonl")
     ap.add_argument("--keep-always", action="store_true", help="also train on cases the base model always solved")
+    ap.add_argument("--unscored-out", default="",
+                    help="Only write the non-held-out cases with no pass rate yet (input for another filter run), then exit")
+    ap.add_argument("--source-filter", default="", help="With --unscored-out: only cases whose source contains this")
     args = ap.parse_args()
 
     tasks = load_jsonl(args.tasks)
     rates = {r["key"]: r for r in load_jsonl(args.synth_log)}
     if not rates:
         print(f"Note: no pass rates found in {args.synth_log}; every case is treated as unmeasured.")
+    if args.unscored_out:
+        todo = [t for t in tasks if not is_holdout(t["id"], args.holdout_percent) and t["id"] not in rates
+                and args.source_filter in t.get("source", "")]
+        with open(args.unscored_out, "w", encoding="utf-8") as f:
+            for t in todo:
+                f.write(json.dumps(t) + "\n")
+        langs = collections.Counter(t.get("kind", t.get("lang")) for t in todo)
+        print(f"Wrote {len(todo)} unscored cases -> {args.unscored_out}: "
+              + ", ".join(f"{k} {v}" for k, v in sorted(langs.items())))
+        return
 
     holdout, train, dropped_always = [], [], 0
     groups = collections.Counter()

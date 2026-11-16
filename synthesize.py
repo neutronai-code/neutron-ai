@@ -18,7 +18,8 @@ from sandbox import verify
 
 
 def sample_completion(url: str, model: str, sys_prompt: str, prompt: str, api_key: str, temperature: float,
-                      max_tokens: int = 0, timeout: float = 180, thinking: bool | None = None) -> str:
+                      max_tokens: int = 0, timeout: float = 180, thinking: bool | None = None,
+                      meta: dict | None = None) -> str:
     body = {
         "model": model,
         "temperature": temperature,
@@ -36,7 +37,12 @@ def sample_completion(url: str, model: str, sys_prompt: str, prompt: str, api_ke
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        msg = json.loads(resp.read().decode("utf-8"))["choices"][0]["message"]
+        data = json.loads(resp.read().decode("utf-8"))
+    choice = data["choices"][0]
+    msg = choice["message"]
+    if meta is not None:  # answer length incl. thinking, and whether it hit the max_tokens cap ("length")
+        meta["tokens"] = (data.get("usage") or {}).get("completion_tokens")
+        meta["finish"] = choice.get("finish_reason")
     content = msg.get("content") or ""
     # Servers with a reasoning parser return the thinking separately; put it back so SFT traces keep it.
     reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
@@ -79,11 +85,15 @@ def finalize(tasks: list[dict], log_path: str, sft_out: str, rl_out: str) -> tup
                     results[r["key"]] = r
     sft_rows, rl_rows = [], []
     rates_by_lang = collections.defaultdict(list)
+    lengths_by_lang = collections.defaultdict(list)
     for i, t in enumerate(tasks):
         r = results.get(_task_key(t, i))
         if r is None:
             continue
         rates_by_lang[t.get("lang", "python")].append(r["pass_rate"])
+        for tok, fin, ok in zip(r.get("tokens") or [], r.get("finish") or [], r.get("passed") or []):
+            if tok:
+                lengths_by_lang[t.get("lang", "python")].append((tok, fin, ok))
         if r.get("best"):
             sft_rows.append({
                 "id": t.get("id", ""),
@@ -107,6 +117,14 @@ def finalize(tasks: list[dict], log_path: str, sft_out: str, rl_out: str) -> tup
         always = sum(r == 1.0 for r in rates)
         never = sum(r == 0.0 for r in rates)
         print(f"{lang:14s} {len(rates):6d} {always:7d} {never:6d} {len(rates) - always - never:10d}")
+    if lengths_by_lang:
+        print("\nAnswer length in tokens, thinking included ('cut off' = hit the max_tokens cap):")
+        print(f"{'lang':14s} {'correct p50':>11s} {'p90':>6s} {'max':>6s} {'cut off':>8s}")
+        for lang, rows in sorted(lengths_by_lang.items()):
+            ok = sorted(tok for tok, _, good in rows if good)
+            pct = lambda q: ok[min(len(ok) - 1, int(q * len(ok)))] if ok else 0
+            cut = sum(fin == "length" for _, fin, _ in rows) / len(rows)
+            print(f"{lang:14s} {pct(0.5):11d} {pct(0.9):6d} {(ok[-1] if ok else 0):6d} {cut:8.0%}")
     print(f"\nWrote {len(sft_rows)} verified SFT traces -> {sft_out} | {len(rl_rows)} RL curriculum tasks -> {rl_out}")
     return len(sft_rows), len(rl_rows)
 
@@ -139,14 +157,18 @@ def run_engine(tasks_path: str, sft_out: str, rl_out: str, url: str, model: str,
             candidates = [f"<think>Solve {t['id']} cleanly.</think>\n{good}", "```python\ndef broken(): pass\n```"]
         else:
             sys_prompt = system_prompt_for(t)
+            metas = [{} for _ in range(samples)]
             candidates = [_sample_with_retry(url, model, sys_prompt, t["prompt"], api_key, temperature,
-                                             max_tokens=max_tokens, timeout=timeout, thinking=thinking)
-                          for _ in range(samples)]
+                                             max_tokens=max_tokens, timeout=timeout, thinking=thinking, meta=m)
+                          for m in metas]
             if any(c is None for c in candidates):  # server trouble: don't record a fake 0%, retry on resume
                 return
-        wins = [c for c in candidates if _passes(c, t)]
+        passed = [_passes(c, t) for c in candidates]
+        wins = [c for c, ok in zip(candidates, passed) if ok]
         rate = round(len(wins) / len(candidates), 3) if candidates else 0.0
         rec = {"key": _task_key(t, i), "n": len(candidates), "pass_rate": rate, "best": min(wins, key=len) if wins else ""}
+        if not mock:  # per-sample lengths decide the training token budget (see length_report)
+            rec.update(tokens=[m.get("tokens") for m in metas], finish=[m.get("finish") for m in metas], passed=passed)
         with lock:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec) + "\n")
