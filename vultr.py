@@ -19,7 +19,7 @@ Usage:
   uv run vultr.py script --hf-repo NeutronAI/Hadron-7B-v0.9 --steps 300 --max-minutes 60
   $env:VULTR_API_KEY="..."; $env:HF_TOKEN="..."; uv run vultr.py launch --plan vcg-a100-1c-6g-16vram --region ewr --hf-repo NeutronAI/Hadron-7B-v0.9 --dry-run
 """
-import argparse, base64, json, os, urllib.error, urllib.request
+import argparse, base64, json, os, re, urllib.error, urllib.request
 
 VULTR_API = "https://api.vultr.com/v2"
 
@@ -70,27 +70,44 @@ def build_self_destruct_script(
         if hf_repo
         else ""
     )
-    if job == "synth" and hf_repo:
+    if job in ("synth", "eval") and hf_repo:
         hf_up = '"$HOME/.local/bin/uvx" --from huggingface_hub hf upload'
+        tag = re.sub(r"[^A-Za-z0-9._-]+", "_", base_model.split("/")[-1])
+        uploads = ([("sft_verified.jsonl", "sft_verified.jsonl"), ("rl_curriculum.jsonl", "rl_curriculum.jsonl"),
+                    ("synth_log.jsonl", "synth_log.jsonl")] if job == "synth"
+                   else [("eval_report.jsonl", f"eval/{tag}.jsonl"), ("eval_summary.txt", f"eval/{tag}.txt")])
+        lines = "".join(
+            f'    if [ -f "/workspace/neutron-ai/{src}" ]; then {hf_up} "{hf_repo}" "/workspace/neutron-ai/{src}" "{dst}" '
+            f'--repo-type dataset --token "$HF_TOKEN" || true; fi\n'
+            for src, dst in uploads
+        )
+        run_log = "synth-run.log" if job == "synth" else f"eval/{tag}-run.log"
         log_upload_block = (
             '  if [ -n "${HF_TOKEN:-}" ]; then\n'
-            "    for f in sft_verified.jsonl rl_curriculum.jsonl synth_log.jsonl; do\n"
-            f'      if [ -f "/workspace/neutron-ai/$f" ]; then {hf_up} "{hf_repo}" "/workspace/neutron-ai/$f" "$f" '
-            '--repo-type dataset --token "$HF_TOKEN" || true; fi\n'
-            "    done\n"
-            f'    {hf_up} "{hf_repo}" /var/log/neutron-train.log synth-run.log --repo-type dataset --token "$HF_TOKEN" >/dev/null 2>&1 || true\n'
+            f"{lines}"
+            f'    {hf_up} "{hf_repo}" /var/log/neutron-train.log "{run_log}" --repo-type dataset --token "$HF_TOKEN" >/dev/null 2>&1 || true\n'
             "  fi\n"
         )
+    # vLLM server for synth/eval; tensor-parallel across every GPU on the VM (e.g. 2x A16 for a 9B in bf16).
+    vllm_block = (
+        'TP="$(nvidia-smi -L | wc -l)"\n'
+        f'nohup uv run vllm serve "{base_model}" --port 8000 --max-model-len 12288 --gpu-memory-utilization 0.90 '
+        '--tensor-parallel-size "$TP" --reasoning-parser qwen3 > /var/log/vllm.log 2>&1 &\n'
+        "for i in $(seq 1 90); do curl -sf localhost:8000/v1/models >/dev/null && break; sleep 10; done\n"
+        'curl -sf localhost:8000/v1/models >/dev/null || { echo "[NeutronAI] vLLM did not start:"; tail -80 /var/log/vllm.log; exit 1; }\n'
+    )
     if job == "synth":
         synth_minutes = max(10, max_minutes - 30)  # leave time for installs, model download and the uploads
-        job_block = (
-            f'nohup uv run vllm serve "{base_model}" --port 8000 --max-model-len 12288 --gpu-memory-utilization 0.90 '
-            "--reasoning-parser qwen3 > /var/log/vllm.log 2>&1 &\n"
-            "for i in $(seq 1 90); do curl -sf localhost:8000/v1/models >/dev/null && break; sleep 10; done\n"
-            'curl -sf localhost:8000/v1/models >/dev/null || { echo "[NeutronAI] vLLM did not start:"; tail -80 /var/log/vllm.log; exit 1; }\n'
+        job_block = vllm_block + (
             f'uv run synthesize.py --data "{dataset}" --url http://localhost:8000/v1/chat/completions --model "{base_model}" '
             f"--samples 4 --workers 32 --max-tokens 6144 --timeout 1800 --thinking on --log synth_log.jsonl "
             f"--max-minutes {synth_minutes} {train_args}\n"
+        )
+    elif job == "eval":
+        eval_data = "tasks.jsonl" if dataset == "mbpp" else dataset
+        job_block = vllm_block + (
+            f'uv run eval.py --data "{eval_data}" --url http://localhost:8000/v1/chat/completions --model "{base_model}" '
+            f"--workers 8 --timeout 1800 --temperature 0.6 --report eval_report.jsonl {train_args} | tee eval_summary.txt\n"
         )
     else:
         hf_flag = f'--push-hf "{hf_repo}"' if hf_repo else ""
@@ -171,6 +188,11 @@ def cmd_plans(api_key: str):
 def cmd_launch(args) -> dict:
     if not args.repo_url:
         raise SystemExit("--repo-url is required for launch: the VM clones it to get train.py and the dataset.")
+    if not args.api_key:
+        raise SystemExit("Set your Vultr API key first (cmd: set VULTR_API_KEY=...  PowerShell: $env:VULTR_API_KEY=\"...\").")
+    if args.hf_repo and not args.hf_token:
+        raise SystemExit("Set HF_TOKEN (a Hugging Face *write* token) first, or the results can't be uploaded and are "
+                         "lost when the VM deletes itself.")
     script = build_self_destruct_script(
         repo_url=args.repo_url,
         base_model=args.model,
@@ -276,8 +298,8 @@ if __name__ == "__main__":
     ap.add_argument("--out-script", default="vultr_job.sh")
     ap.add_argument("--keep-alive", action="store_true", help="Disable automatic VM DELETE on exit")
     ap.add_argument("--train-args", default="", help='Extra train.py flags, e.g. "--max-seq-len 16384 --thinking on"')
-    ap.add_argument("--job", choices=["grpo", "synth"], default="grpo",
-                    help="grpo = train; synth = measure task difficulty with vLLM + harvest verified traces (--hf-repo is a dataset repo)")
+    ap.add_argument("--job", choices=["grpo", "synth", "eval"], default="grpo",
+                    help="grpo = train; synth = measure task difficulty + harvest verified traces; eval = benchmark --model on --data (default tasks.jsonl). synth/eval upload to the HF *dataset* repo --hf-repo")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--confirm", action="store_true", help="Required to actually create a billable Vultr VM")
     ap.add_argument("--self-check", action="store_true")

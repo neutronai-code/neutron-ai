@@ -98,9 +98,12 @@ def query_endpoint(url: str, model: str, sys_prompt: str, prompt: str, api_key: 
         return json.loads(resp.read().decode("utf-8"))["choices"][0]["message"]["content"]
 
 
+TEMPERATURE = None  # --temperature; None = 0.0 for n=1, 0.6 for pass@k sampling
+
+
 def eval_single_task(task: dict, url: str, model: str, api_key: str, n: int, repair_turns: int, mock: bool) -> dict:
     sys_prompt = system_prompt_for(task)
-    temp = 0.0 if n == 1 else 0.6
+    temp = TEMPERATURE if TEMPERATURE is not None else (0.0 if n == 1 else 0.6)
     passed_samples, rewards, statuses, latencies = 0, [], [], []
 
     for _ in range(n):
@@ -199,6 +202,8 @@ if __name__ == "__main__":
     ap.add_argument("--api-key", default="")
     ap.add_argument("--n", type=int, default=1)
     ap.add_argument("--k", default="1")
+    ap.add_argument("--temperature", type=float, default=None,
+                    help="Sampling temperature (default 0.0 for n=1). Qwen3/3.5 thinking models: use 0.6, greedy can loop")
     ap.add_argument("--repair-turns", type=int, default=1, help="Set to 2-3 to evaluate multi-turn test-guided self-repair")
     ap.add_argument("--workers", type=int, default=6, help="Tasks sent at once; use 1 for a local CPU model (Ollama)")
     ap.add_argument("--timeout", type=float, default=180, help="Seconds to wait for each model reply; raise it (e.g. 1800) for slow local models")
@@ -207,6 +212,7 @@ if __name__ == "__main__":
     ap.add_argument("--mock", action="store_true")
     args = ap.parse_args()
     repair.REQUEST_TIMEOUT = args.timeout
+    TEMPERATURE = args.temperature
     ks = [int(x) for x in args.k.split(",") if x.strip()]
     summary = run_eval(args.data, args.url, args.model, args.api_key, args.n, ks, args.repair_turns, args.workers, args.report, args.compare, args.mock)
     if args.mock:
