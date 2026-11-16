@@ -111,8 +111,21 @@ def build_self_destruct_script(
         )
     else:
         hf_flag = f'--push-hf "{hf_repo}"' if hf_repo else ""
-        job_block = (
-            f'uv run train.py --mode grpo --model "{base_model}" --data "{dataset}" '
+        # Optional fast kernels for Qwen3.5's linear-attention layers. Each is kept only if kernel_check.py shows it
+        # really runs on this GPU; any failure just means the (slower, identical-result) PyTorch path is used.
+        fast_kernels = (
+            'echo "[NeutronAI] Trying optional fast kernels (flash-linear-attention, causal-conv1d)..."\n'
+            "uv pip install flash-linear-attention || true\n"
+            "uv run --no-sync python kernel_check.py fla || uv pip uninstall flash-linear-attention || true\n"
+            'NVCC="$(ls .venv/lib/python3*/site-packages/nvidia/*/bin/nvcc 2>/dev/null | head -1 || true)"\n'
+            'if [ -n "$NVCC" ]; then export CUDA_HOME="$(dirname "$(dirname "$NVCC")")"; export PATH="$CUDA_HOME/bin:$PATH"; fi\n'
+            "uv pip install ninja packaging setuptools wheel >/dev/null 2>&1 || true\n"
+            'TORCH_CUDA_ARCH_LIST="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1)" MAX_JOBS=4 '
+            "timeout 1500 uv pip install --no-build-isolation causal-conv1d || true\n"
+            "uv run --no-sync python kernel_check.py conv || uv pip uninstall causal-conv1d || true\n"
+        )
+        job_block = fast_kernels + (
+            f'uv run --no-sync train.py --mode grpo --model "{base_model}" --data "{dataset}" '
             f"--steps {steps} --max-minutes {max_minutes} --export-gguf {hf_flag} --out hadron-out {train_args}\n"
         )
     destroy_block = (

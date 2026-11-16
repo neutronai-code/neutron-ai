@@ -11,7 +11,7 @@ Full NeutronAI training stack:
 Vultr Cost-Guard:
   Pass `--max-minutes 45` so a runaway hangout never drains your $300 GPU credits, and DESTROY the Vultr VM right after `--push-hf`!
 """
-import argparse, inspect, json, re, sys, time
+import argparse, inspect, json, os, re, sys, time
 from repair import CODE_SYS, system_prompt_for
 from sandbox import grpo_reward_func, reasoning_format_reward_func
 
@@ -71,7 +71,13 @@ def make_prompt_renderer(tokenizer, thinking: str, max_completion: int):
     return render, on
 
 
-def load_rl_dataset(source: str, render=None):
+def _curriculum_key(r: dict) -> float:
+    """Most informative first: measured ~50% pass rate, then unmeasured tasks (assumed hard), then never-solved."""
+    rate = r.get("baseline_pass_rate")
+    return 0.3 if rate is None else abs(rate - 0.5)
+
+
+def load_rl_dataset(source: str, render=None, tokenizer=None, max_prompt_tokens: int = 0):
     from datasets import Dataset, load_dataset
 
     fmt = render or (lambda messages: messages)
@@ -94,7 +100,17 @@ def load_rl_dataset(source: str, render=None):
 
     with open(source, encoding="utf-8") as f:
         rows = [json.loads(line) for line in f if line.strip()]
-    rows.sort(key=lambda r: abs(r.get("baseline_pass_rate", 0.5) - 0.5))
+    rows.sort(key=_curriculum_key)  # stable: ties keep file order
+    if tokenizer is not None and max_prompt_tokens and render is not None:
+        # TRL may ignore max_prompt_length; drop overlong prompts so a long repo task can't OOM the GPU.
+        def n_tokens(r):
+            text = render([{"role": "system", "content": system_prompt_for(r)}, {"role": "user", "content": r["prompt"]}])
+            return len(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+        before = len(rows)
+        rows = [r for r in rows if n_tokens(r) <= max_prompt_tokens]
+        if len(rows) < before:
+            print(f"[NeutronAI] dropped {before - len(rows)} tasks with prompts over {max_prompt_tokens} tokens", flush=True)
     return Dataset.from_list([
         {
             "prompt": fmt([
@@ -153,6 +169,47 @@ def _make_wallclock_guard(max_minutes: float):
     return BudgetGuardCallback()
 
 
+def _make_hub_checkpoint_callback(repo_id: str):
+    """After every checkpoint save, upload it to `<repo>/last-checkpoint` in the background, so a crashed or
+    timed-out VM loses at most one save interval. `--resume` picks it back up on a fresh VM."""
+    from huggingface_hub import HfApi
+    from transformers import TrainerCallback
+
+    api = HfApi()
+
+    class HubCheckpointCallback(TrainerCallback):
+        def on_save(self, args, state, control, **kwargs):
+            ckpt = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+            if os.path.isdir(ckpt):
+                print(f"[NeutronAI] uploading checkpoint-{state.global_step} -> {repo_id}/last-checkpoint", flush=True)
+                api.upload_folder(repo_id=repo_id, folder_path=ckpt, path_in_repo="last-checkpoint",
+                                  commit_message=f"checkpoint step {state.global_step}", run_as_future=True)
+            return control
+
+    return HubCheckpointCallback()
+
+
+def _find_resume_checkpoint(out_dir: str, repo_id: str) -> str | None:
+    """Latest local checkpoint in out_dir, else the hub's last-checkpoint (downloaded), else None."""
+    if os.path.isdir(out_dir):
+        ckpts = sorted((d for d in os.listdir(out_dir) if d.startswith("checkpoint-")), key=lambda d: int(d.split("-")[1]))
+        if ckpts:
+            return os.path.join(out_dir, ckpts[-1])
+    if repo_id:
+        from huggingface_hub import snapshot_download
+
+        try:
+            local = snapshot_download(repo_id, allow_patterns=["last-checkpoint/*"], local_dir=f"{out_dir}-resume")
+        except Exception as e:
+            print(f"[NeutronAI] no hub checkpoint to resume from ({e})", flush=True)
+            return None
+        path = os.path.join(local, "last-checkpoint")
+        if os.path.isfile(os.path.join(path, "trainer_state.json")):
+            print(f"[NeutronAI] resuming from {repo_id}/last-checkpoint", flush=True)
+            return path
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["sft", "dpo", "grpo", "fim-grpo"], default="grpo")
@@ -162,7 +219,10 @@ def main():
     ap.add_argument("--num-generations", type=int, default=6)
     ap.add_argument("--max-seq-len", type=int, default=3072)
     ap.add_argument("--max-minutes", type=float, default=0.0, help="Hard wall-clock stop to protect Vultr credits (0=off)")
-    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--resume", action="store_true",
+                    help="Continue from the latest checkpoint (local, else <--push-hf>/last-checkpoint on the Hub)")
+    ap.add_argument("--save-steps", type=int, default=0, help="Checkpoint every N steps (0 = auto, at most 50)")
+    ap.add_argument("--max-prompt-tokens", type=int, default=1024, help="Drop RL tasks whose prompt is longer")
     ap.add_argument("--export-gguf", action="store_true")
     ap.add_argument("--push-hf", default="")
     ap.add_argument("--out", default="hadron-v0.9")
@@ -232,6 +292,9 @@ def main():
     print(f"[NeutronAI] thinking={'on' if thinking_on else 'off'} (max completion {args.max_seq_len - 1024} tokens)", flush=True)
 
     callbacks = [_make_wallclock_guard(args.max_minutes)] if args.max_minutes > 0 else []
+    if args.push_hf:
+        callbacks.append(_make_hub_checkpoint_callback(args.push_hf))
+    save_steps = args.save_steps or min(50, max(10, args.steps // 4))
 
     if args.mode == "sft":
         from trl import SFTConfig, SFTTrainer
@@ -252,7 +315,8 @@ def main():
                 warmup_ratio=0.1,
                 max_steps=args.steps,
                 logging_steps=1,
-                save_steps=max(10, args.steps // 3),
+                save_steps=save_steps,
+                save_total_limit=2,
                 bf16=is_bfloat16_supported(),
                 fp16=not is_bfloat16_supported(),
                 report_to="none",
@@ -280,7 +344,8 @@ def main():
                 warmup_ratio=0.1,
                 max_steps=args.steps,
                 logging_steps=1,
-                save_steps=max(10, args.steps // 3),
+                save_steps=save_steps,
+                save_total_limit=2,
                 bf16=is_bfloat16_supported(),
                 fp16=not is_bfloat16_supported(),
                 report_to="none",
@@ -304,13 +369,17 @@ def main():
             max_completion_length=args.max_seq_len - 1024,
             max_steps=args.steps,
             logging_steps=1,
-            save_steps=max(10, args.steps // 4),
+            save_steps=save_steps,
+            save_total_limit=2,
             bf16=is_bfloat16_supported(),
             fp16=not is_bfloat16_supported(),
             report_to="none",
         )
-        if "loss_type" in inspect.signature(GRPOConfig.__init__).parameters:
+        grpo_params = inspect.signature(GRPOConfig.__init__).parameters
+        if "loss_type" in grpo_params:
             cfg_kwargs["loss_type"] = "dr_grpo"
+        if "shuffle_dataset" in grpo_params:
+            cfg_kwargs["shuffle_dataset"] = False  # keep the curriculum order (most informative tasks first)
 
         if args.mode == "fim-grpo":
             from datasets import Dataset
@@ -349,10 +418,11 @@ def main():
                 reward_funcs=[grpo_reward_func, reasoning_format_reward_func],
                 callbacks=callbacks,
                 args=GRPOConfig(**cfg_kwargs),
-                train_dataset=load_rl_dataset(args.data, render),
+                train_dataset=load_rl_dataset(args.data, render, tokenizer, args.max_prompt_tokens),
             )
 
-    trainer.train(resume_from_checkpoint=args.resume)
+    resume_from = _find_resume_checkpoint(args.out, args.push_hf) if args.resume else None
+    trainer.train(resume_from_checkpoint=resume_from)
     model.save_pretrained(args.out)
     tokenizer.save_pretrained(args.out)
 
