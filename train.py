@@ -147,19 +147,20 @@ def load_fim_sft_dataset(path: str, tokenizer, max_len: int):
     `<filename>`) gets them converted to its own suffix-first format (fim.to_mellum_prompt). Both end on <|endoftext|>."""
     from datasets import Dataset
 
-    from fim import to_mellum_prompt
+    from fim import convert_fim_prompt
 
-    starcoder = "<fim_prefix>" in tokenizer.get_vocab()
-    if starcoder:
-        print("[NeutronAI] FIM-SFT: StarCoder-style FIM tokens: rows converted to the Mellum format", flush=True)
-    eos = "<|endoftext|>"
+    vocab = tokenizer.get_vocab()
+    style = "starcoder" if "<fim_prefix>" in vocab else "granite" if "<|filename|>" in vocab else "qwen"
+    if style != "qwen":
+        print(f"[NeutronAI] FIM-SFT: {style}-style FIM tokens: rows converted to that format", flush=True)
+    eos = tokenizer.eos_token or "<|endoftext|>"  # Qwen / Mellum: <|endoftext|>; Granite: <|end_of_text|>
     out, dropped = [], 0
     with open(path, encoding="utf-8") as f:
         for line in f:
             if not line.strip():
                 continue
             r = json.loads(line)
-            prompt = to_mellum_prompt(r["fim_prompt"]) if starcoder else r["fim_prompt"]
+            prompt = convert_fim_prompt(r["fim_prompt"], style)
             p = tokenizer(prompt, add_special_tokens=False)["input_ids"]
             c = tokenizer(r["oracle_middle"] + eos, add_special_tokens=False)["input_ids"]
             if len(p) + len(c) > max_len:
@@ -261,6 +262,56 @@ def _find_resume_checkpoint(out_dir: str, repo_id: str) -> str | None:
     return None
 
 
+def hf_model_type(model_name: str) -> str:
+    """config.json's model_type, read from the Hub (or a local folder) without importing the model code."""
+    try:
+        if os.path.isdir(model_name):
+            path = os.path.join(model_name, "config.json")
+        else:
+            from huggingface_hub import hf_hub_download
+
+            path = hf_hub_download(model_name, "config.json")
+        with open(path, encoding="utf-8") as f:
+            return json.load(f).get("model_type", "")
+    except Exception:
+        return ""
+
+
+PLAIN_HF_TYPES = {"mellum"}  # architectures trained with plain transformers + PEFT instead of Unsloth
+
+
+def load_plain_lora(model_name: str, rank: int = 32):
+    """bf16 model + LoRA with plain transformers + PEFT, for architectures Unsloth doesn't cover. Mixture-of-experts
+    models whose experts are fused 3-D tensors (JetBrains Mellum2: mlp.experts.gate_up_proj / down_proj) get LoRA on
+    those tensors through PEFT's `target_parameters`, plus the usual attention projections. The experts run on
+    transformers' grouped-matmul kernel when this torch/GPU has it."""
+    import torch
+    from peft import LoraConfig, get_peft_model
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    kw = dict(dtype=torch.bfloat16, attn_implementation="sdpa", device_map="cuda")
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_name, experts_implementation="grouped_mm", **kw)
+    except (TypeError, ValueError) as e:  # no MoE kernel option for this model / version: the default is fine
+        print(f"[NeutronAI] experts_implementation=grouped_mm not available ({e}); using the default", flush=True)
+        model = AutoModelForCausalLM.from_pretrained(model_name, **kw)
+    model.config.use_cache = False
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.enable_input_require_grads()
+    experts = sorted({".".join(n.split(".")[-3:]) for n, prm in model.named_parameters() if prm.dim() == 3})
+    names = {n.rsplit(".", 1)[-1] for n, _ in model.named_modules()}
+    attn = [m for m in ("q_proj", "k_proj", "v_proj", "o_proj") if m in names]
+    dense_mlp = [] if experts else [m for m in ("gate_proj", "up_proj", "down_proj") if m in names]
+    cfg = LoraConfig(r=rank, lora_alpha=rank, lora_dropout=0.0, task_type="CAUSAL_LM",
+                     target_modules=attn + dense_mlp, **({"target_parameters": experts} if experts else {}))
+    model = get_peft_model(model, cfg)
+    trainable = sum(prm.numel() for prm in model.parameters() if prm.requires_grad)
+    print(f"[NeutronAI] plain transformers + PEFT LoRA r={rank}: modules {attn + dense_mlp}, expert tensors {experts}; "
+          f"{trainable / 1e6:.0f}M trainable weights", flush=True)
+    return model, tokenizer
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["sft", "fim-sft", "dpo", "grpo", "fim-grpo", "repo-grpo"], default="grpo")
@@ -289,6 +340,9 @@ def main():
                     help="Train every weight (bf16, 8-bit AdamW) instead of a LoRA adapter. fim-sft only; for small "
                          "models (Quark 1.5B needs ~20GB VRAM + activations)")
     ap.add_argument("--batch-size", type=int, default=4, help="fim-sft: rows per GPU micro-batch")
+    ap.add_argument("--plain-hf", action="store_true",
+                    help="fim-sft LoRA with plain transformers + PEFT instead of Unsloth (automatic for "
+                         "architectures in PLAIN_HF_TYPES, e.g. JetBrains Mellum2)")
     ap.add_argument("--grad-accum", type=int, default=4, help="fim-sft: micro-batches per optimizer step")
     args = ap.parse_args()
     if args.full_finetune and args.mode != "fim-sft":
@@ -298,60 +352,68 @@ def main():
 
     # ponytail: single-GPU Unsloth handles 1.5B-32B; upgrade to multi-node verl/OpenRLHF when funded past 1x H100.
     import torch
-    from unsloth import FastLanguageModel, FastModel, PatchDPOTrainer, is_bfloat16_supported
+    plain = args.plain_hf or hf_model_type(args.model) in PLAIN_HF_TYPES
+    if plain:
+        if args.mode != "fim-sft" or args.full_finetune:
+            sys.exit("[NeutronAI] the plain transformers path is wired up for fim-sft LoRA only.")
+        model, tokenizer = load_plain_lora(args.model)
+        is_bfloat16_supported = torch.cuda.is_bf16_supported
+        vision = False
+    else:
+        from unsloth import FastLanguageModel, FastModel, PatchDPOTrainer, is_bfloat16_supported
 
-    vram_gb = (torch.cuda.get_device_properties(0).total_memory / (1024**3)) if torch.cuda.is_available() else 0.0
-    # Use vLLM fast_inference on >=24GB single GPUs; on 16GB cards (e.g. A16/T4) use Unsloth native generation to avoid OOM!
-    use_vllm = (args.mode in ("grpo", "fim-grpo", "repo-grpo")) and (vram_gb >= 22.0)
-    if vram_gb > 0 and vram_gb < 22.0 and args.num_generations > 4:
-        args.num_generations = 4
-    load_4bit = not args.full_finetune and (args.load_in_4bit == "yes" or (args.load_in_4bit == "auto" and vram_gb < 40.0))
-    if is_qwen35(args.model) and args.load_in_4bit != "yes":
-        # Qwen3.5 must train in bf16. Refuse early if the weights clearly won't fit, instead of silently degrading.
-        load_4bit = False
-        need_gb = model_billions(args.model) * 2.3 + 4.0  # bf16 weights (+vision tower) + LoRA/activation headroom
-        if vram_gb and need_gb > vram_gb:
-            sys.exit(f"[NeutronAI] {args.model} needs ~{need_gb:.0f}GB VRAM in bf16 but this GPU has {vram_gb:.0f}GB. "
-                     f"Unsloth advises against 4-bit training for Qwen3.5. Use a smaller model (Qwen/Qwen3.5-4B), "
-                     f"a bigger GPU, or force it with --load-in-4bit yes.")
-    elif is_qwen35(args.model) and load_4bit:
-        print("[NeutronAI] WARNING: Unsloth advises against 4-bit training on Qwen3.5 (quality loss).", flush=True)
-    vision = is_vision_model(args.model)
-    print(f"[NeutronAI] model={args.model} vision_arch={vision} vram={vram_gb:.0f}GB 4bit={load_4bit} vllm={use_vllm}", flush=True)
+        vram_gb = (torch.cuda.get_device_properties(0).total_memory / (1024**3)) if torch.cuda.is_available() else 0.0
+        # Use vLLM fast_inference on >=24GB single GPUs; on 16GB cards (e.g. A16/T4) use Unsloth native generation to avoid OOM!
+        use_vllm = (args.mode in ("grpo", "fim-grpo", "repo-grpo")) and (vram_gb >= 22.0)
+        if vram_gb > 0 and vram_gb < 22.0 and args.num_generations > 4:
+            args.num_generations = 4
+        load_4bit = not args.full_finetune and (args.load_in_4bit == "yes" or (args.load_in_4bit == "auto" and vram_gb < 40.0))
+        if is_qwen35(args.model) and args.load_in_4bit != "yes":
+            # Qwen3.5 must train in bf16. Refuse early if the weights clearly won't fit, instead of silently degrading.
+            load_4bit = False
+            need_gb = model_billions(args.model) * 2.3 + 4.0  # bf16 weights (+vision tower) + LoRA/activation headroom
+            if vram_gb and need_gb > vram_gb:
+                sys.exit(f"[NeutronAI] {args.model} needs ~{need_gb:.0f}GB VRAM in bf16 but this GPU has {vram_gb:.0f}GB. "
+                         f"Unsloth advises against 4-bit training for Qwen3.5. Use a smaller model (Qwen/Qwen3.5-4B), "
+                         f"a bigger GPU, or force it with --load-in-4bit yes.")
+        elif is_qwen35(args.model) and load_4bit:
+            print("[NeutronAI] WARNING: Unsloth advises against 4-bit training on Qwen3.5 (quality loss).", flush=True)
+        vision = is_vision_model(args.model)
+        print(f"[NeutronAI] model={args.model} vision_arch={vision} vram={vram_gb:.0f}GB 4bit={load_4bit} vllm={use_vllm}", flush=True)
 
-    loader = FastModel if vision else FastLanguageModel
-    load_kwargs = dict(model_name=args.model, max_seq_length=args.max_seq_len, load_in_4bit=load_4bit)
-    if use_vllm or not vision:  # keep the original FastLanguageModel call unchanged for text models
-        load_kwargs.update(fast_inference=use_vllm, gpu_memory_utilization=0.65 if vram_gb >= 22.0 else 0.55)
-    if args.full_finetune:
-        load_kwargs.update(full_finetuning=True, load_in_4bit=False)
-    model, tokenizer = loader.from_pretrained(**load_kwargs)
-    if args.full_finetune:
-        print(f"[NeutronAI] full fine-tune: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e9:.2f}B "
-              f"trainable weights", flush=True)
-    elif not hasattr(model, "peft_config"):
-        if vision:
-            # Text-only training: LoRA on the language model's attention + MLP, vision tower frozen.
-            model = FastModel.get_peft_model(
-                model,
-                finetune_vision_layers=False,
-                finetune_language_layers=True,
-                finetune_attention_modules=True,
-                finetune_mlp_modules=True,
-                r=32,
-                lora_alpha=32,
-                use_gradient_checkpointing="unsloth",
-                random_state=42,
-            )
-        else:
-            model = FastLanguageModel.get_peft_model(
-                model,
-                r=32,
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-                lora_alpha=32,
-                use_gradient_checkpointing="unsloth",
-                random_state=42,
-            )
+        loader = FastModel if vision else FastLanguageModel
+        load_kwargs = dict(model_name=args.model, max_seq_length=args.max_seq_len, load_in_4bit=load_4bit)
+        if use_vllm or not vision:  # keep the original FastLanguageModel call unchanged for text models
+            load_kwargs.update(fast_inference=use_vllm, gpu_memory_utilization=0.65 if vram_gb >= 22.0 else 0.55)
+        if args.full_finetune:
+            load_kwargs.update(full_finetuning=True, load_in_4bit=False)
+        model, tokenizer = loader.from_pretrained(**load_kwargs)
+        if args.full_finetune:
+            print(f"[NeutronAI] full fine-tune: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e9:.2f}B "
+                  f"trainable weights", flush=True)
+        elif not hasattr(model, "peft_config"):
+            if vision:
+                # Text-only training: LoRA on the language model's attention + MLP, vision tower frozen.
+                model = FastModel.get_peft_model(
+                    model,
+                    finetune_vision_layers=False,
+                    finetune_language_layers=True,
+                    finetune_attention_modules=True,
+                    finetune_mlp_modules=True,
+                    r=32,
+                    lora_alpha=32,
+                    use_gradient_checkpointing="unsloth",
+                    random_state=42,
+                )
+            else:
+                model = FastLanguageModel.get_peft_model(
+                    model,
+                    r=32,
+                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                    lora_alpha=32,
+                    use_gradient_checkpointing="unsloth",
+                    random_state=42,
+                )
     # Vision models come with a multimodal processor; all our data is text, so use its inner text tokenizer.
     if vision:
         tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
@@ -565,7 +627,20 @@ def main():
     model.save_pretrained(args.out)
     tokenizer.save_pretrained(args.out)
 
-    if args.push_hf and args.full_finetune:  # no adapter to merge: the model itself is the result
+    if args.push_hf and plain:
+        try:  # fold the LoRA into the weights and upload a normal model (vLLM / llama.cpp can load it directly)
+            merged = model.merge_and_unload()
+            merged.push_to_hub(args.push_hf, commit_message="LoRA fine-tune, merged")
+            tokenizer.push_to_hub(args.push_hf)
+        except Exception as e:  # never lose a finished run: at least upload the LoRA adapter
+            print(f"[NeutronAI] Merged upload failed ({e}); uploading the LoRA adapter instead.", flush=True)
+            from huggingface_hub import HfApi
+
+            HfApi().upload_folder(repo_id=args.push_hf, folder_path=args.out, path_in_repo="lora_adapter")
+        if args.export_gguf:
+            print("[NeutronAI] GGUF export skipped on the plain transformers path (Unsloth's exporter); convert the "
+                  "merged model with llama.cpp's convert_hf_to_gguf.py instead.", flush=True)
+    elif args.push_hf and args.full_finetune:  # no adapter to merge: the model itself is the result
         model.push_to_hub(args.push_hf, commit_message="Full fine-tune result")
         tokenizer.push_to_hub(args.push_hf)
         if args.export_gguf:

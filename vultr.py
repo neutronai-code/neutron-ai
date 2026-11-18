@@ -15,6 +15,7 @@ What `vultr.py` solves (100% Python stdlib, zero SDK bloat):
 Usage:
   uv run vultr.py --self-check
   $env:VULTR_API_KEY="..."; uv run vultr.py plans
+  uv run vultr.py account    # credit left, this period's charges, what is running and its $/hr
   $env:VULTR_API_KEY="..."; uv run vultr.py status   # your VMs + IPs (password is printed once, at launch)
   uv run vultr.py script --hf-repo NeutronAI/Hadron-7B-v0.9 --steps 300 --max-minutes 60
   $env:VULTR_API_KEY="..."; $env:HF_TOKEN="..."; uv run vultr.py launch --plan vcg-a100-1c-6g-16vram --region ewr --hf-repo NeutronAI/Hadron-7B-v0.9 --dry-run
@@ -294,6 +295,37 @@ def cmd_status(api_key: str):
         print(f'\nWatch training:  ssh root@{ready[0]["main_ip"]} "tail -f /var/log/neutron-train.log"')
 
 
+def cmd_account(api_key: str):
+    """Credit left, charges so far this billing period, and what is running now (with its hourly cost), so you can
+    tell whether a new run fits. Prints no passwords or personal details."""
+    from datetime import datetime, timezone
+
+    acct = _vultr_req("GET", "/account", api_key).get("account", {})
+    balance, pending = float(acct.get("balance") or 0), float(acct.get("pending_charges") or 0)
+    # Vultr shows prepaid credit as a NEGATIVE balance; this period's not-yet-billed usage is pending_charges.
+    left = -balance - pending
+    print(f"Account balance        : {balance:,.2f}  (negative = credit you have)")
+    print(f"Charges this period    : {pending:,.2f}  (not billed yet)")
+    print(f"Credit left after those: {left:,.2f}")
+    plans = {p["id"]: p for p in _vultr_req("GET", "/plans?per_page=500", api_key).get("plans", [])}
+    insts = _vultr_req("GET", "/instances?per_page=100", api_key).get("instances", [])
+    burn = 0.0
+    if insts:
+        print(f"\n{'RUNNING NOW':24s} | {'PLAN':28s} | {'$/HR':6s} | HOURS SO FAR")
+        for i in insts:
+            rate = float(plans.get(i.get("plan", ""), {}).get("hourly_cost") or 0)
+            burn += rate
+            try:
+                hrs = (datetime.now(timezone.utc) - datetime.fromisoformat(i["date_created"])).total_seconds() / 3600
+            except (KeyError, ValueError):
+                hrs = float("nan")
+            print(f"{i.get('label', ''):24s} | {i.get('plan', ''):28s} | {rate:6.3f} | {hrs:6.1f}")
+        print(f"\nBurning ${burn:.2f}/hour now"
+              + (f": the credit left lasts ~{left / burn:.0f} more hours at this rate." if burn and left > 0 else "."))
+    else:
+        print("\nNothing running (no hourly charges).")
+
+
 def run_self_check():
     script = build_self_destruct_script(
         repo_url="https://github.com/neutron-ai/neutron.git",
@@ -318,7 +350,7 @@ def run_self_check():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("action", nargs="?", default="script", choices=["plans", "script", "launch", "status"])
+    ap.add_argument("action", nargs="?", default="script", choices=["plans", "script", "launch", "status", "account"])
     ap.add_argument("--api-key", default=os.environ.get("VULTR_API_KEY", ""))
     ap.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""))
     ap.add_argument("--plan", default="vcg-a16-6c-60g-16vram")
@@ -348,6 +380,8 @@ if __name__ == "__main__":
         cmd_plans(args.api_key)
     elif args.action == "status":
         cmd_status(args.api_key)
+    elif args.action == "account":
+        cmd_account(args.api_key)
     elif args.action == "launch":
         cmd_launch(args)
     else:

@@ -11,7 +11,7 @@ running the tests (the original is known to pass).
   modal run modal_repo_fim.py --eval --models Qwen/Qwen2.5-Coder-1.5B,neutronai-code/Quark-1.5B-v0.2
   -> repo_eval_report.jsonl (one line per model x hole) and a table by language / repo / hole size
   Results merge into the existing report, so scoring one new model also shows the earlier ones in the table.
-  Add --repos owner/name,... to re-run only those repos.
+  Add --repos owner/name,... to re-run only those repos. --gen-gpu L40S for models over ~8B (A10G: 24 GB).
   With repo context (make_ctx_bench.py): --data repo_holes_ctx.jsonl --report repo_eval_report_ctx.jsonl
 
 GRPO reward server (RepoChecker): `modal deploy modal_repo_fim.py` once (again after changing repo_fim.py or this
@@ -103,7 +103,12 @@ def generate(models: list[str], prompts: list[str], max_tokens: int = 512) -> di
 
     out = {}
     for model in models:
-        server = _serve(model)
+        try:
+            server = _serve(model)
+        except Exception as e:  # one model that won't load (e.g. an architecture this vLLM lacks) mustn't sink the rest
+            print(f"!! {model} could not be served ({e}); its fills are left empty", flush=True)
+            out[model] = [""] * len(prompts)
+            continue
         try:
             hf_cache.commit()
             url = "http://localhost:8000/v1/completions"
@@ -192,7 +197,7 @@ class RepoChecker:
         return repo_fim.check_fill(self.root, path, lo, hi, middle, self.cfg["test"], self.timeout)[0]
 
 
-def run_eval(models: list[str], data: str, chunk: int, limit: int, repos: list[str], report: str):
+def run_eval(models: list[str], data: str, chunk: int, limit: int, repos: list[str], report: str, gen_gpu: str):
     import repo_fim
 
     info = repo_fim.load_repo_info(str(HERE / "quark_repos.jsonl"))
@@ -212,7 +217,7 @@ def run_eval(models: list[str], data: str, chunk: int, limit: int, repos: list[s
         fills = saved["fills"]
         print(f"Reusing the saved fills in {cache.name}")
     else:
-        fills = generate.remote(models, [r["fim_prompt"] for r in rows])
+        fills = generate.with_options(gpu=gen_gpu).remote(models, [r["fim_prompt"] for r in rows])
         cache.write_text(json.dumps({"key": key, "fills": fills}), encoding="utf-8")
 
     passed = {}  # (model, row index) -> bool
@@ -274,14 +279,15 @@ def run_eval(models: list[str], data: str, chunk: int, limit: int, repos: list[s
 @app.local_entrypoint()
 def main(repos: str = "", max_holes: int = 40, minutes: float = 45, out: str = "repo_holes.jsonl",
          eval: bool = False, models: str = "", data: str = "repo_holes.jsonl", chunk: int = 40, limit: int = 0,
-         report: str = "repo_eval_report.jsonl"):
+         report: str = "repo_eval_report.jsonl", gen_gpu: str = "A10G"):
     import repo_fim
 
     if eval:
         model_list = [m.strip() for m in models.split(",") if m.strip()]
         if not model_list:
             raise SystemExit("--eval needs --models, e.g. --models Qwen/Qwen2.5-Coder-1.5B,neutronai-code/Quark-1.5B-v0.2")
-        return run_eval(model_list, data, chunk, limit, [r.strip() for r in repos.split(",") if r.strip()], report)
+        return run_eval(model_list, data, chunk, limit, [r.strip() for r in repos.split(",") if r.strip()], report,
+                        gen_gpu)
 
     info = repo_fim.load_repo_info(str(HERE / "quark_repos.jsonl"))
     names = [r.strip() for r in repos.split(",") if r.strip()] or list(repo_fim.REPOS)

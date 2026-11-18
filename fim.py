@@ -289,28 +289,35 @@ FIM_STOPS = ["<|endoftext|>", "<|fim_pad|>", "<|file_sep|>", "<|fim_prefix|>"]
 
 
 MELLUM_STOPS = ["<|endoftext|>", "<filename>", "<fim_prefix>", "<fim_suffix>"]
+GRANITE_STOPS = ["<|end_of_text|>", "<|filename|>", "<|fim_prefix|>", "<|fim_pad|>"]
+
+_FIM_STYLE: dict[str, str] = {}
 
 
-_STARCODER_FIM: dict[str, bool] = {}
-
-
-def is_mellum(model: str) -> bool:
-    """Does this model use StarCoder-style FIM tokens (JetBrains Mellum and models fine-tuned from it, e.g. a Quark
-    built on Mellum)? Decided from its tokenizer on the Hub, so the name doesn't matter; cached per model."""
-    if model not in _STARCODER_FIM:
+def fim_style(model: str) -> str:
+    """Which FIM prompt format a model uses, from its tokenizer on the Hub (so the name doesn't matter and a fine-tune
+    inherits its base's format): "starcoder" (JetBrains Mellum: `<fim_prefix>`, `<filename>`, suffix first), "granite"
+    (IBM Granite: Qwen's FIM tokens but `<|filename|>` for repo files), or "qwen". Cached per model."""
+    if model not in _FIM_STYLE:
         try:
             from huggingface_hub import hf_hub_download
 
             with open(hf_hub_download(model, "tokenizer_config.json"), encoding="utf-8") as f:
-                _STARCODER_FIM[model] = '"<fim_prefix>"' in f.read()
+                tok = f.read()
+            _FIM_STYLE[model] = ("starcoder" if '"<fim_prefix>"' in tok else
+                                 "granite" if '"<|filename|>"' in tok else "qwen")
         except Exception:
-            _STARCODER_FIM[model] = "mellum" in model.lower()
-    return _STARCODER_FIM[model]
+            _FIM_STYLE[model] = "starcoder" if "mellum" in model.lower() else "qwen"
+    return _FIM_STYLE[model]
+
+
+def is_mellum(model: str) -> bool:
+    return fim_style(model) == "starcoder"
 
 
 def to_mellum_prompt(prompt: str) -> str:
-    """A Qwen-format FIM prompt (`[<|file_sep|>path\\n...]<|fim_prefix|>P<|fim_suffix|>S<|fim_middle|>`) in JetBrains
-    Mellum's format: `[<filename>path\\n...]<fim_suffix>S<fim_prefix>P<fim_middle>` (suffix first, as on its card)."""
+    """A Qwen-format FIM prompt (`[<|file_sep|>path\n...]<|fim_prefix|>P<|fim_suffix|>S<|fim_middle|>`) in JetBrains
+    Mellum's format: `[<filename>path\n...]<fim_suffix>S<fim_prefix>P<fim_middle>` (suffix first, as on its card)."""
     i = prompt.index(FIM_PRE)
     ctx, rest = prompt[:i], prompt[i + len(FIM_PRE):]
     pre, rest = rest.split(FIM_SUF, 1)
@@ -318,13 +325,22 @@ def to_mellum_prompt(prompt: str) -> str:
     return ctx.replace(FIM_SEP, "<filename>") + "<fim_suffix>" + suf + "<fim_prefix>" + pre + "<fim_middle>"
 
 
+def to_granite_prompt(prompt: str) -> str:
+    """Granite uses Qwen's FIM tokens in the same order, but `<|filename|>` instead of `<|file_sep|>`."""
+    return prompt.replace(FIM_SEP, "<|filename|>")
+
+
+def convert_fim_prompt(prompt: str, style: str) -> str:
+    return {"starcoder": to_mellum_prompt, "granite": to_granite_prompt}.get(style, lambda p: p)(prompt)
+
+
 def query_fim_samples(url: str, model: str, fim_prompt: str, api_key: str = "", max_tokens: int = 256,
                       temperature: float = 0.0, n: int = 1) -> list[str]:
     """Raw FIM for base models via /v1/completions: the prompt is `<|fim_prefix|>...<|fim_suffix|>...<|fim_middle|>`
-    (converted for Mellum models, which use StarCoder-style tokens)."""
-    stops = FIM_STOPS
-    if is_mellum(model):
-        fim_prompt, stops = to_mellum_prompt(fim_prompt), MELLUM_STOPS
+    (converted for models with another FIM format: see fim_style)."""
+    style = fim_style(model)
+    fim_prompt = convert_fim_prompt(fim_prompt, style)
+    stops = {"starcoder": MELLUM_STOPS, "granite": GRANITE_STOPS}.get(style, FIM_STOPS)
     payload = json.dumps({"model": model, "prompt": fim_prompt, "max_tokens": max_tokens, "temperature": temperature,
                           "n": n, "stop": stops, "skip_special_tokens": False}).encode("utf-8")
     headers = {"Content-Type": "application/json"}
