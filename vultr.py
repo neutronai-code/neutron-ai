@@ -111,6 +111,20 @@ def build_self_destruct_script(
             f'uv run eval.py --data "{eval_data}" --url http://localhost:8000/v1/chat/completions --model "{base_model}" '
             f"--workers 8 --timeout 1800 --temperature 0.6 --report eval_report.jsonl {train_args} | tee eval_summary.txt\n"
         )
+    elif job == "fim-sft":
+        # Quark FIM-SFT. Big data files don't go through git: `--data hf:<owner>/<dataset>/<file>` downloads <file>
+        # from that (private) HF dataset repo first.
+        hf_flag = f'--push-hf "{hf_repo}"' if hf_repo else ""
+        data_file, fetch = dataset, ""
+        if dataset.startswith("hf:"):
+            owner, name, data_file = dataset[3:].split("/", 2)
+            fetch = (f'"$HOME/.local/bin/uvx" --from huggingface_hub hf download "{owner}/{name}" "{data_file}" '
+                     f'--repo-type dataset --local-dir . --token "$HF_TOKEN"\n')
+        job_block = fetch + (
+            f'uv run --no-sync train.py --mode fim-sft --model "{base_model}" --data "{data_file}" '
+            f"--steps {steps} --max-minutes {max_minutes} --load-in-4bit no --export-gguf {hf_flag} "
+            f"--out quark-out {train_args}\n"
+        )
     else:
         hf_flag = f'--push-hf "{hf_repo}"' if hf_repo else ""
         # Optional fast kernels for Qwen3.5's linear-attention layers. Each is kept only if kernel_check.py shows it
@@ -293,6 +307,12 @@ def run_self_check():
     assert "DELETE \"https://api.vultr.com/v2/instances/${VULTR_INSTANCE_ID}\"" in script, script
     assert "--max-minutes 60" in script and "--push-hf \"neutronai-code/Hadron-4B-v0.1\"" in script, script
     assert "169.254.169.254/v1/instance-v2-id" in script, script
+    q = build_self_destruct_script("https://github.com/x/y.git", "neutronai-code/Quark-1.5B-v0.3-sft",
+                                   "hf:neutronai-code/quark-data/fim_v04.jsonl", 7000, 600,
+                                   "neutronai-code/Quark-1.5B-v0.4", train_args="--full-finetune", job="fim-sft")
+    assert 'hf download "neutronai-code/quark-data" "fim_v04.jsonl" --repo-type dataset' in q, q
+    assert '--mode fim-sft --model "neutronai-code/Quark-1.5B-v0.3-sft" --data "fim_v04.jsonl"' in q, q
+    assert "--full-finetune" in q and "trap cleanup EXIT" in q, q
     print("vultr.py (NeutronAI) self-check passed: cloud-init script verified with metadata ID discovery + trap EXIT self-destruct.")
 
 
@@ -315,7 +335,7 @@ if __name__ == "__main__":
     ap.add_argument("--out-script", default="vultr_job.sh")
     ap.add_argument("--keep-alive", action="store_true", help="Disable automatic VM DELETE on exit")
     ap.add_argument("--train-args", default="", help='Extra train.py flags, e.g. "--max-seq-len 16384 --thinking on"')
-    ap.add_argument("--job", choices=["grpo", "synth", "eval"], default="grpo",
+    ap.add_argument("--job", choices=["grpo", "synth", "eval", "fim-sft"], default="grpo",
                     help="grpo = train; synth = measure task difficulty + harvest verified traces; eval = benchmark --model on --data (default tasks.jsonl). synth/eval upload to the HF *dataset* repo --hf-repo")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--confirm", action="store_true", help="Required to actually create a billable Vultr VM")

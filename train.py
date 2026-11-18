@@ -138,6 +138,57 @@ def load_sft_dataset(path: str, tokenizer):
     ])
 
 
+def load_fim_sft_dataset(path: str, tokenizer, max_len: int):
+    """FIM-SFT rows ({fim_prompt, oracle_middle}) -> token ids with the loss only on the fill + <|endoftext|>,
+    the token Quark stops on at inference. Rows with "loss": "all" (quark_data_v04.py's whole-file rows) put the
+    loss on every token instead. Rows longer than max_len tokens are dropped.
+
+    The rows are in Qwen's FIM format; a model with StarCoder-style tokens (JetBrains Mellum: `<fim_prefix>`,
+    `<filename>`) gets them converted to its own suffix-first format (fim.to_mellum_prompt). Both end on <|endoftext|>."""
+    from datasets import Dataset
+
+    from fim import to_mellum_prompt
+
+    starcoder = "<fim_prefix>" in tokenizer.get_vocab()
+    if starcoder:
+        print("[NeutronAI] FIM-SFT: StarCoder-style FIM tokens: rows converted to the Mellum format", flush=True)
+    eos = "<|endoftext|>"
+    out, dropped = [], 0
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            prompt = to_mellum_prompt(r["fim_prompt"]) if starcoder else r["fim_prompt"]
+            p = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+            c = tokenizer(r["oracle_middle"] + eos, add_special_tokens=False)["input_ids"]
+            if len(p) + len(c) > max_len:
+                dropped += 1
+                continue
+            out.append({"input_ids": p + c, "labels": (p if r.get("loss") == "all" else [-100] * len(p)) + c,
+                        "length": len(p) + len(c)})  # for group_by_length batching
+    print(f"[NeutronAI] FIM-SFT: {len(out)} examples ({dropped} longer than {max_len} tokens dropped)", flush=True)
+    return Dataset.from_list(out)
+
+
+def _fim_sft_collator(pad_id: int):
+    import torch
+
+    def collate(batch):
+        n = max(len(b["input_ids"]) for b in batch)
+        ids = torch.full((len(batch), n), pad_id, dtype=torch.long)
+        labels = torch.full((len(batch), n), -100, dtype=torch.long)
+        mask = torch.zeros((len(batch), n), dtype=torch.long)
+        for i, b in enumerate(batch):
+            k = len(b["input_ids"])
+            ids[i, :k] = torch.tensor(b["input_ids"])
+            labels[i, :k] = torch.tensor(b["labels"])
+            mask[i, :k] = 1
+        return {"input_ids": ids, "labels": labels, "attention_mask": mask}
+
+    return collate
+
+
 def load_dpo_dataset(path: str, tokenizer):
     from datasets import Dataset
 
@@ -212,7 +263,9 @@ def _find_resume_checkpoint(out_dir: str, repo_id: str) -> str | None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["sft", "dpo", "grpo", "fim-grpo"], default="grpo")
+    ap.add_argument("--mode", choices=["sft", "fim-sft", "dpo", "grpo", "fim-grpo", "repo-grpo"], default="grpo")
+    ap.add_argument("--holes-per-step", type=int, default=4, help="repo-grpo: holes per optimizer step")
+    ap.add_argument("--lr", type=float, default=0.0, help="Learning rate override (fim-sft default 1e-4)")
     ap.add_argument("--model", default="Qwen/Qwen2.5-Coder-1.5B-Instruct")
     ap.add_argument("--data", default="tasks.jsonl")
     ap.add_argument("--steps", type=int, default=50)
@@ -232,7 +285,14 @@ def main():
                     help="Qwen3/3.5 thinking mode. auto = on only if the completion budget (max-seq-len - 1024) >= 8192")
     ap.add_argument("--load-in-4bit", choices=["auto", "yes", "no"], default="auto",
                     help="auto = 4-bit below 40GB VRAM, bf16 on bigger GPUs (A100 80GB)")
+    ap.add_argument("--full-finetune", action="store_true",
+                    help="Train every weight (bf16, 8-bit AdamW) instead of a LoRA adapter. fim-sft only; for small "
+                         "models (Quark 1.5B needs ~20GB VRAM + activations)")
+    ap.add_argument("--batch-size", type=int, default=4, help="fim-sft: rows per GPU micro-batch")
+    ap.add_argument("--grad-accum", type=int, default=4, help="fim-sft: micro-batches per optimizer step")
     args = ap.parse_args()
+    if args.full_finetune and args.mode != "fim-sft":
+        sys.exit("[NeutronAI] --full-finetune is only wired up for --mode fim-sft.")
     if args.push_hf:
         hf_preflight(args.push_hf)
 
@@ -242,10 +302,10 @@ def main():
 
     vram_gb = (torch.cuda.get_device_properties(0).total_memory / (1024**3)) if torch.cuda.is_available() else 0.0
     # Use vLLM fast_inference on >=24GB single GPUs; on 16GB cards (e.g. A16/T4) use Unsloth native generation to avoid OOM!
-    use_vllm = (args.mode in ("grpo", "fim-grpo")) and (vram_gb >= 22.0)
+    use_vllm = (args.mode in ("grpo", "fim-grpo", "repo-grpo")) and (vram_gb >= 22.0)
     if vram_gb > 0 and vram_gb < 22.0 and args.num_generations > 4:
         args.num_generations = 4
-    load_4bit = args.load_in_4bit == "yes" or (args.load_in_4bit == "auto" and vram_gb < 40.0)
+    load_4bit = not args.full_finetune and (args.load_in_4bit == "yes" or (args.load_in_4bit == "auto" and vram_gb < 40.0))
     if is_qwen35(args.model) and args.load_in_4bit != "yes":
         # Qwen3.5 must train in bf16. Refuse early if the weights clearly won't fit, instead of silently degrading.
         load_4bit = False
@@ -263,8 +323,13 @@ def main():
     load_kwargs = dict(model_name=args.model, max_seq_length=args.max_seq_len, load_in_4bit=load_4bit)
     if use_vllm or not vision:  # keep the original FastLanguageModel call unchanged for text models
         load_kwargs.update(fast_inference=use_vllm, gpu_memory_utilization=0.65 if vram_gb >= 22.0 else 0.55)
+    if args.full_finetune:
+        load_kwargs.update(full_finetuning=True, load_in_4bit=False)
     model, tokenizer = loader.from_pretrained(**load_kwargs)
-    if not hasattr(model, "peft_config"):
+    if args.full_finetune:
+        print(f"[NeutronAI] full fine-tune: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e9:.2f}B "
+              f"trainable weights", flush=True)
+    elif not hasattr(model, "peft_config"):
         if vision:
             # Text-only training: LoRA on the language model's attention + MLP, vision tower frozen.
             model = FastModel.get_peft_model(
@@ -296,9 +361,40 @@ def main():
     callbacks = [_make_wallclock_guard(args.max_minutes)] if args.max_minutes > 0 else []
     if args.push_hf:
         callbacks.append(_make_hub_checkpoint_callback(args.push_hf))
-    save_steps = args.save_steps or min(50, max(10, args.steps // 4))
+    # Full fine-tune checkpoints hold every weight + optimizer state (~10GB), so upload them less often.
+    save_steps = args.save_steps or (min(500, max(50, args.steps // 10)) if args.full_finetune
+                                     else min(50, max(10, args.steps // 4)))
 
-    if args.mode == "sft":
+    if args.mode == "fim-sft":  # supervised fill-in-the-middle: learn the original code for each hole
+        from transformers import Trainer, TrainingArguments
+
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        trainer = Trainer(
+            model=model,
+            train_dataset=load_fim_sft_dataset(args.data, tokenizer, args.max_seq_len),
+            data_collator=_fim_sft_collator(pad_id),
+            callbacks=callbacks,
+            args=TrainingArguments(
+                output_dir=args.out,
+                per_device_train_batch_size=args.batch_size,
+                gradient_accumulation_steps=args.grad_accum,
+                learning_rate=args.lr or (2e-5 if args.full_finetune else 1e-4),  # every weight moves: smaller steps
+                optim="adamw_8bit" if args.full_finetune else "adamw_torch",
+                weight_decay=0.01 if args.full_finetune else 0.0,
+                train_sampling_strategy="group_by_length",  # similar-length rows per batch: far less padding
+                lr_scheduler_type="cosine",
+                warmup_steps=max(1, args.steps // 20),  # 5% (transformers 5 dropped warmup_ratio)
+                max_steps=args.steps,
+                logging_steps=5,
+                save_steps=save_steps,
+                save_total_limit=2,
+                bf16=is_bfloat16_supported(),
+                fp16=not is_bfloat16_supported(),
+                remove_unused_columns=False,
+                report_to="none",
+            ),
+        )
+    elif args.mode == "sft":
         from trl import SFTConfig, SFTTrainer
 
         trainer = SFTTrainer(
@@ -358,7 +454,7 @@ def main():
 
         cfg_kwargs = dict(
             output_dir=args.out,
-            learning_rate=5e-6,
+            learning_rate=args.lr or 5e-6,
             lr_scheduler_type="cosine",
             warmup_ratio=0.05,
             beta=0.0,
@@ -383,7 +479,34 @@ def main():
         if "shuffle_dataset" in grpo_params:
             cfg_kwargs["shuffle_dataset"] = False  # keep the curriculum order (most informative tasks first)
 
-        if args.mode == "fim-grpo":
+        if args.mode == "repo-grpo":  # real-repo holes, rewarded by the repo's own tests (repo_fim.py, RepoChecker)
+            from datasets import Dataset
+            from repo_fim import repo_grpo_reward_func
+
+            # Repo prompts are ~1,000 tokens; a prompt cut from the left would lose its <|fim_prefix|> token, so give
+            # prompts their own budget and drop the few that don't fit. Several holes per step: their tests run at once.
+            cfg_kwargs.update(max_prompt_length=args.max_prompt_tokens,
+                              max_completion_length=args.max_seq_len - args.max_prompt_tokens,
+                              gradient_accumulation_steps=args.num_generations * args.holes_per_step)
+            with open(args.data, encoding="utf-8") as f:
+                rows = [json.loads(l) for l in f if l.strip()]  # already in repo blocks: keep the file order
+            before = len(rows)
+            rows = [r for r in rows if len(tokenizer(r["fim_prompt"])["input_ids"]) <= args.max_prompt_tokens]
+            print(f"[NeutronAI] repo-GRPO holes: {len(rows)} (dropped {before - len(rows)} with long prompts), "
+                  f"{args.holes_per_step} per step", flush=True)
+            trainer = GRPOTrainer(
+                model=model,
+                processing_class=tokenizer,
+                reward_funcs=[repo_grpo_reward_func],
+                callbacks=callbacks,
+                args=GRPOConfig(**cfg_kwargs),
+                train_dataset=Dataset.from_list([
+                    {"prompt": r["fim_prompt"], "repo": r["repo"], "path": r["path"], "lo": r["lo"], "hi": r["hi"],
+                     "oracle_middle": r["oracle_middle"], "next_repo": r.get("next_repo", "")}
+                    for r in rows
+                ]),
+            )
+        elif args.mode == "fim-grpo":
             from datasets import Dataset
             from fim import fim_grpo_reward_func
 
@@ -396,6 +519,9 @@ def main():
             # No measured difficulty for FIM tasks, and the file is grouped by language: mix it (fixed seed, so
             # --resume sees the same order) since shuffle_dataset is off to keep Hadron's curriculum order.
             random.Random(42).shuffle(fim_rows)
+            if any("baseline_pass_rate" in r for r in fim_rows):  # filtered by `fim.py filter`: ~50% holes first
+                fim_rows.sort(key=lambda r: abs(r.get("baseline_pass_rate", 0.5) - 0.5))
+                print("[NeutronAI] FIM curriculum: holes the model solves about half the time first", flush=True)
             fmt = render or (lambda messages: messages)
             # Base FIM models (Qwen2.5-Coder-1.5B etc.) are trained on the raw `<|fim_prefix|>...<|fim_middle|>` string,
             # exactly what an editor sends at the cursor; chat-wrapping it would train a format nobody will use.
@@ -439,7 +565,15 @@ def main():
     model.save_pretrained(args.out)
     tokenizer.save_pretrained(args.out)
 
-    if args.push_hf:
+    if args.push_hf and args.full_finetune:  # no adapter to merge: the model itself is the result
+        model.push_to_hub(args.push_hf, commit_message="Full fine-tune result")
+        tokenizer.push_to_hub(args.push_hf)
+        if args.export_gguf:
+            try:
+                model.push_to_hub_gguf(f"{args.push_hf}-GGUF", tokenizer, quantization_method="q4_k_m")
+            except Exception as e:
+                print(f"[NeutronAI] GGUF export/upload failed ({e}); the bf16 model is already uploaded.", flush=True)
+    elif args.push_hf:
         try:
             model.push_to_hub_merged(args.push_hf, tokenizer, save_method="merged_16bit")
             if vision:  # vLLM needs the base model's processor files even for text-only use

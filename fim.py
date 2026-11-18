@@ -98,46 +98,82 @@ def fim_grpo_reward_func(completions, prefix, suffix, test, lang=None, repo_file
     return scores
 
 
-def mine_fim_tasks_from_python(task_id: str, clean_code: str, test_code: str, max_spans: int = 3,
-                               lang: str = "python", shuffle_seed: str = "") -> list[dict]:
-    """Carve AST-aligned `Return`, `Assign`, and loop/branch bodies into verified FIM tasks."""
-    lines = clean_code.splitlines(keepends=True)
-    tree = ast.parse(clean_code)
+def python_spans(code: str, hard: bool = False) -> list[tuple[int, int]]:
+    """AST-aligned hole spans (0-based [lo, hi) line ranges) in Python code, in AST order.
+    Normal: 1-6 line Return/Assign/loop/branch statements. hard=True: 3-15 lines, adding with/try blocks and whole
+    function bodies (keeping the docstring, which tells the model what the body should do)."""
+    lines = code.splitlines(keepends=True)
+    tree = ast.parse(code)
+    min_n, max_n = (3, 15) if hard else (1, 6)
+    kinds = (ast.Return, ast.Assign, ast.AugAssign, ast.For, ast.While, ast.If)
+    if hard:
+        kinds += (ast.With, ast.Try)
     spans = []
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Return, ast.Assign, ast.AugAssign, ast.For, ast.While, ast.If)) and hasattr(node, "lineno") and hasattr(node, "end_lineno"):
-            lo, hi = node.lineno - 1, node.end_lineno
-            if 0 <= lo < hi <= len(lines) and (hi - lo) <= 6:
-                spans.append((lo, hi))
+        if isinstance(node, kinds) and hasattr(node, "lineno") and hasattr(node, "end_lineno"):
+            spans.append((node.lineno - 1, node.end_lineno))
+        if hard and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+            body = node.body
+            if len(body) > 1 and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant):
+                body = body[1:]
+            spans.append((body[0].lineno - 1, node.end_lineno))
+    return [(lo, hi) for lo, hi in spans if 0 <= lo < hi <= len(lines) and min_n <= hi - lo <= max_n]
+
+
+def mine_fim_tasks_from_python(task_id: str, clean_code: str, test_code: str, max_spans: int = 3,
+                               lang: str = "python", shuffle_seed: str = "", hard: bool = False) -> list[dict]:
+    """Carve AST-aligned `Return`, `Assign`, and loop/branch bodies into verified FIM tasks.
+    hard=True: 3-15 line holes instead (whole loops/branches/with/try blocks and whole function bodies)."""
+    lines = clean_code.splitlines(keepends=True)
+    spans = python_spans(clean_code, hard)
     if shuffle_seed:  # vary which spans get picked (deterministically per case) instead of always the first ones
         random.Random(shuffle_seed).shuffle(spans)
-    return _verified_fim_tasks(task_id, lines, spans, test_code, lang, "    pass", max_spans)
+    return _verified_fim_tasks(task_id, lines, spans, test_code, lang, "    pass", max_spans, "_H" if hard else "")
+
+
+def brace_spans(lines: list[str], hard: bool = False) -> list[tuple[int, int]]:
+    """Brace languages (JS/TS/C++): 1-4 consecutive indented statement lines whose braces balance.
+    hard=True: 3-12 line spans that may contain blank lines and closing braces, i.e. whole nested blocks."""
+    closers = ("{", "}", "};", "});", ")")
+    comment = ("//", "/*", "*", "#")
+    if hard:
+        ok_line = [not ln.strip() or ln[:1] in (" ", "	") for ln in lines]
+        can_start = [bool(ln.strip()) and ln[:1] in (" ", "	") and not ln.strip().startswith(("}", ")") + comment)
+                     for ln in lines]
+        sizes = range(1, 13)
+    else:
+        ok_line = [bool(ln.strip()) and ln[:1] in (" ", "	") and ln.strip() not in closers
+                   and not ln.strip().startswith(comment) for ln in lines]
+        can_start = ok_line
+        sizes = range(1, 5)
+    spans = []
+    for lo in range(len(lines)):
+        if not can_start[lo]:
+            continue
+        for size in sizes:
+            hi = lo + size
+            if hi > len(lines) or not ok_line[hi - 1]:
+                break
+            if hard and (size < 3 or not lines[hi - 1].strip()):
+                continue
+            chunk = "".join(lines[lo:hi])
+            if all(chunk.count(a) == chunk.count(b) for a, b in (("{}", "()", "[]") if hard else ("{}", "()"))):
+                spans.append((lo, hi))
+    return spans
 
 
 def mine_fim_tasks_from_lines(task_id: str, code: str, test_code: str, lang: str, max_spans: int = 2,
-                              shuffle_seed: str = "") -> list[dict]:
-    """Brace languages (JS/TS/C++): carve 1-4 consecutive indented statement lines whose braces balance."""
+                              shuffle_seed: str = "", hard: bool = False) -> list[dict]:
+    """Brace languages (JS/TS/C++): carve 1-4 consecutive indented statement lines whose braces balance.
+    hard=True: 3-12 line holes that may contain blank lines and closing braces, i.e. whole nested blocks."""
     lines = code.splitlines(keepends=True)
-    ok_line = [
-        bool(ln.strip()) and ln[:1] in (" ", "\t") and ln.strip() not in ("{", "}", "};", "});", ")")
-        and not ln.strip().startswith(("//", "/*", "*", "#"))
-        for ln in lines
-    ]
-    spans = []
-    for lo in range(len(lines)):
-        for size in (1, 2, 3, 4):
-            hi = lo + size
-            if hi > len(lines) or not all(ok_line[lo:hi]):
-                break
-            chunk = "".join(lines[lo:hi])
-            if chunk.count("{") == chunk.count("}") and chunk.count("(") == chunk.count(")"):
-                spans.append((lo, hi))
+    spans = brace_spans(lines, hard)
     random.Random(shuffle_seed or task_id).shuffle(spans)
-    return _verified_fim_tasks(task_id, lines, spans, test_code, lang, "/* TODO */", max_spans)
+    return _verified_fim_tasks(task_id, lines, spans, test_code, lang, "/* TODO */", max_spans, "_H" if hard else "")
 
 
 def _verified_fim_tasks(task_id: str, lines: list[str], spans: list[tuple[int, int]], test_code: str, lang: str,
-                        hole: str, max_spans: int) -> list[dict]:
+                        hole: str, max_spans: int, id_tag: str = "") -> list[dict]:
     """Keep spans where the spliced oracle passes AND a blank hole fails (so the middle really matters)."""
     seen, tasks, original_ok = set(), [], None
     for lo, hi in spans:
@@ -157,7 +193,7 @@ def _verified_fim_tasks(task_id: str, lines: list[str], spans: list[tuple[int, i
             continue
         seen.add((lo, hi))
         tasks.append({
-            "id": f"fim_{task_id}_L{lo+1}",
+            "id": f"fim_{task_id}_L{lo+1}{id_tag}",
             "category": "fim",
             "lang": lang,
             "prefix": prefix,
@@ -252,19 +288,58 @@ def run_self_check():
 FIM_STOPS = ["<|endoftext|>", "<|fim_pad|>", "<|file_sep|>", "<|fim_prefix|>"]
 
 
-def query_fim_completion(url: str, model: str, fim_prompt: str, api_key: str = "", max_tokens: int = 256) -> str:
-    """Raw FIM for base models via /v1/completions: the prompt is `<|fim_prefix|>...<|fim_suffix|>...<|fim_middle|>`."""
-    payload = json.dumps({"model": model, "prompt": fim_prompt, "max_tokens": max_tokens, "temperature": 0.0,
-                          "stop": FIM_STOPS, "skip_special_tokens": False}).encode("utf-8")
+MELLUM_STOPS = ["<|endoftext|>", "<filename>", "<fim_prefix>", "<fim_suffix>"]
+
+
+_STARCODER_FIM: dict[str, bool] = {}
+
+
+def is_mellum(model: str) -> bool:
+    """Does this model use StarCoder-style FIM tokens (JetBrains Mellum and models fine-tuned from it, e.g. a Quark
+    built on Mellum)? Decided from its tokenizer on the Hub, so the name doesn't matter; cached per model."""
+    if model not in _STARCODER_FIM:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            with open(hf_hub_download(model, "tokenizer_config.json"), encoding="utf-8") as f:
+                _STARCODER_FIM[model] = '"<fim_prefix>"' in f.read()
+        except Exception:
+            _STARCODER_FIM[model] = "mellum" in model.lower()
+    return _STARCODER_FIM[model]
+
+
+def to_mellum_prompt(prompt: str) -> str:
+    """A Qwen-format FIM prompt (`[<|file_sep|>path\\n...]<|fim_prefix|>P<|fim_suffix|>S<|fim_middle|>`) in JetBrains
+    Mellum's format: `[<filename>path\\n...]<fim_suffix>S<fim_prefix>P<fim_middle>` (suffix first, as on its card)."""
+    i = prompt.index(FIM_PRE)
+    ctx, rest = prompt[:i], prompt[i + len(FIM_PRE):]
+    pre, rest = rest.split(FIM_SUF, 1)
+    suf = rest[:rest.rindex(FIM_MID)]
+    return ctx.replace(FIM_SEP, "<filename>") + "<fim_suffix>" + suf + "<fim_prefix>" + pre + "<fim_middle>"
+
+
+def query_fim_samples(url: str, model: str, fim_prompt: str, api_key: str = "", max_tokens: int = 256,
+                      temperature: float = 0.0, n: int = 1) -> list[str]:
+    """Raw FIM for base models via /v1/completions: the prompt is `<|fim_prefix|>...<|fim_suffix|>...<|fim_middle|>`
+    (converted for Mellum models, which use StarCoder-style tokens)."""
+    stops = FIM_STOPS
+    if is_mellum(model):
+        fim_prompt, stops = to_mellum_prompt(fim_prompt), MELLUM_STOPS
+    payload = json.dumps({"model": model, "prompt": fim_prompt, "max_tokens": max_tokens, "temperature": temperature,
+                          "n": n, "stop": stops, "skip_special_tokens": False}).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
-            return json.loads(resp.read().decode("utf-8"))["choices"][0]["text"]
+            return [c["text"] for c in json.loads(resp.read().decode("utf-8"))["choices"]]
     except urllib.error.HTTPError as e:  # surface the server's reason (e.g. a 400 message) instead of just the code
         raise RuntimeError(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:300]}") from None
+
+
+def query_fim_completion(url: str, model: str, fim_prompt: str, api_key: str = "", max_tokens: int = 256) -> str:
+    return query_fim_samples(url, model, fim_prompt, api_key, max_tokens)[0]
 
 
 def _clean_oracle(code: str) -> str:
@@ -272,21 +347,70 @@ def _clean_oracle(code: str) -> str:
     return (m[-1] if m else code or "").strip("\n")
 
 
-def _mine_case(t: dict, max_spans: int) -> list[dict]:
+def _mine_case(t: dict, max_spans: int, hard: bool = False) -> list[dict]:
     lang, code = t.get("lang", "python"), _clean_oracle(t.get("oracle_solution", ""))
     if not code or t.get("files") or t.get("kind") == "repo_python" or lang == "sql":
         return []
+    seed = t["id"] + (":hard" if hard else "")
     try:
         if lang in ("python", "python_stdio"):
-            return mine_fim_tasks_from_python(t["id"], code, t["test"], max_spans, lang=lang, shuffle_seed=t["id"])
+            return mine_fim_tasks_from_python(t["id"], code, t["test"], max_spans, lang=lang, shuffle_seed=seed, hard=hard)
         if lang in ("javascript", "typescript", "cpp"):
-            return mine_fim_tasks_from_lines(t["id"], code, t["test"], lang, max_spans, shuffle_seed=t["id"])
+            return mine_fim_tasks_from_lines(t["id"], code, t["test"], lang, max_spans, shuffle_seed=seed, hard=hard)
     except (SyntaxError, ValueError) as e:
         print(f"  skip {t['id']}: {type(e).__name__}", flush=True)
     return []
 
 
-def mine_from_cases(source: str, holdout_path: str, out: str, holdout_out: str, max_spans: int, workers: int, limit: int):
+def filter_fim(data: str, out: str, url: str, model: str, samples: int = 4, temperature: float = 0.8,
+               workers: int = 32, limit: int = 0) -> int:
+    """Difficulty filter: the model answers every hole `samples` times. Holes it always fills correctly teach RL
+    nothing and are dropped; the rest get `baseline_pass_rate` and are written most-informative first (~50% pass
+    rate, then never-solved), which train.py keeps as the training order."""
+    with open(data, encoding="utf-8") as f:
+        rows = [json.loads(l) for l in f if l.strip()]
+    if limit:
+        rows = rows[:limit]
+
+    def one(r):
+        try:
+            replies = query_fim_samples(url, model, r["fim_prompt"], temperature=temperature, n=samples)
+        except Exception as e:  # noqa: BLE001 - server trouble: leave the hole out rather than guess its rate
+            return None, f"{type(e).__name__}: {str(e)[:200]}"
+        lang = r.get("lang", "python")
+        wins = sum(verify_fim(c, r["prefix"], r["suffix"], r["test"], lang)[0] == 1.0 for c in replies)
+        return wins / len(replies), ""
+
+    done, kept, errors = 0, [], collections.Counter()
+    table = collections.defaultdict(collections.Counter)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for r, (rate, err) in zip(rows, pool.map(one, rows)):
+            done += 1
+            if rate is None:
+                errors[err] += 1
+            else:
+                bucket = "always" if rate == 1.0 else "never" if rate == 0.0 else "sometimes"
+                table[r.get("lang", "python")][bucket] += 1
+                if rate < 1.0:
+                    kept.append({**r, "baseline_pass_rate": round(rate, 3)})
+            if done % 500 == 0:
+                print(f"  {done}/{len(rows)} holes scored, {len(kept)} kept", flush=True)
+    for msg, n in errors.most_common(3):
+        print(f"  {n} requests failed: {msg}", flush=True)
+    random.Random(42).shuffle(kept)  # mix languages within each difficulty level
+    kept.sort(key=lambda r: abs(r["baseline_pass_rate"] - 0.5))
+    with open(out, "w", encoding="utf-8") as fo:
+        for r in kept:
+            fo.write(json.dumps(r) + "\n")
+    print(f"\n{'lang':14s} {'always':>7s} {'sometimes':>10s} {'never':>6s}")
+    for lang, c in sorted(table.items()):
+        print(f"{lang:14s} {c['always']:7d} {c['sometimes']:10d} {c['never']:6d}")
+    print(f"Kept {len(kept)} of {len(rows)} holes (dropped the always-solved ones) -> {out}")
+    return len(kept)
+
+
+def mine_from_cases(source: str, holdout_path: str, out: str, holdout_out: str, max_spans: int, workers: int, limit: int,
+                    hard: bool = False):
     with open(source, encoding="utf-8") as f:
         cases = [json.loads(l) for l in f if l.strip()]
     if limit:
@@ -297,7 +421,7 @@ def mine_from_cases(source: str, holdout_path: str, out: str, holdout_out: str, 
             held = {json.loads(l)["id"] for l in f if l.strip()}
     train, test, done = [], [], 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        for t, mined in zip(cases, pool.map(lambda c: _mine_case(c, max_spans), cases)):
+        for t, mined in zip(cases, pool.map(lambda c: _mine_case(c, max_spans, hard), cases)):
             for m in mined:
                 m["source_case"] = t["id"]
             (test if t["id"] in held else train).extend(mined)
@@ -351,7 +475,10 @@ def eval_fim(data: str, url: str, model: str, api_key: str, mode: str, workers: 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("action", nargs="?", default="mine", choices=["mine", "eval"])
+    ap.add_argument("action", nargs="?", default="mine", choices=["mine", "eval", "filter"])
+    ap.add_argument("--hard", action="store_true", help="mine: longer holes (3-15 lines: whole blocks / function bodies)")
+    ap.add_argument("--samples", type=int, default=4, help="filter: answers per hole")
+    ap.add_argument("--temperature", type=float, default=0.8, help="filter: sampling temperature")
     ap.add_argument("--source", default="", help="mine: verified cases file (e.g. tasks_generated.jsonl); empty = legacy tasks.jsonl")
     ap.add_argument("--holdout", default="tasks_holdout.jsonl", help="mine: cases whose FIM tasks go to --holdout-out")
     ap.add_argument("--out", default="fim_tasks.jsonl")
@@ -372,7 +499,11 @@ if __name__ == "__main__":
     if args.self_check:
         run_self_check()
     elif args.action == "mine" and args.source:
-        mine_from_cases(args.source, args.holdout, args.out, args.holdout_out, args.max_spans, args.workers, args.limit)
+        mine_from_cases(args.source, args.holdout, args.out, args.holdout_out, args.max_spans, args.workers, args.limit,
+                        hard=args.hard)
+    elif args.action == "filter":
+        filter_fim(args.data or args.out, args.report or "fim_filtered.jsonl", args.url, args.model, args.samples,
+                   args.temperature, args.workers, args.limit)
     elif args.action == "mine":
         from eval import MOCK_SOLUTIONS
 

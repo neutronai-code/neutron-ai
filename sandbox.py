@@ -972,7 +972,7 @@ def _verify_stdio(solution_text: str, test_code: str, timeout: float) -> tuple[f
 
     per_test = min(max(timeout, 2.0), 6.0)
     passed, first_err = 0, "ok"
-    with tempfile.TemporaryDirectory(prefix="neutron_io_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="neutron_io_", ignore_cleanup_errors=True) as tmp:
         path = os.path.join(tmp, "main.py")
         with open(path, "w", encoding="utf-8") as f:
             f.write(code)
@@ -1024,7 +1024,7 @@ def _verify_uncached(
     prefix = f"{marker}{nonce}:"  # sent on stdin only; never written into any file the solution could read
 
     # ponytail: OS temp dir + AST/JS/CPP/SQL checks + stdin nonce secures single-tenant RLVR; add Docker/gVisor for multi-tenant SaaS.
-    with tempfile.TemporaryDirectory(prefix="neutron_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="neutron_", ignore_cleanup_errors=True) as tmp:
         if is_cpp:
             cpp_units = []
             if files:

@@ -6,7 +6,12 @@ by `fim.py mine`). A completion counts only if the spliced file passes the case'
 
   modal run modal_fim_eval.py
   modal run modal_fim_eval.py --models Qwen/Qwen2.5-Coder-1.5B,Qwen/Qwen3.5-2B-Base --gpu L4
+  modal run modal_fim_eval.py --models ... --data fim_holdout_hard.jsonl      # the longer-hole test set
+
+Difficulty filter for the next Quark round (writes fim_train_v2.jsonl here and to the HF dataset repo):
+  modal run modal_fim_eval.py --filter --models neutronai-code/Quark-1.5B-v0.1
 """
+import json
 import os
 import pathlib
 import re
@@ -17,7 +22,8 @@ import time
 import modal
 
 HERE = pathlib.Path(__file__).parent
-FILES = ["fim.py", "sandbox.py", "repomap.py", "fim_holdout.jsonl"]
+FILES = ["fim.py", "sandbox.py", "repomap.py", "fim_holdout.jsonl", "fim_holdout_hard.jsonl"]
+POOL = ["fim_train.jsonl", "fim_hard_pool.jsonl"]  # holes the filter scores (only baked into the filter's image)
 DEFAULT_MODELS = "Qwen/Qwen2.5-Coder-1.5B,Qwen/Qwen3.5-0.8B-Base,Qwen/Qwen3.5-2B-Base"
 
 image = (  # same base layers as modal_eval.py, so Modal reuses the cached build
@@ -31,7 +37,12 @@ image = (  # same base layers as modal_eval.py, so Modal reuses the cached build
     .env({"HF_XET_HIGH_PERFORMANCE": "1", "VLLM_USE_FLASHINFER_SAMPLER": "0"})
 )
 for f in FILES:
-    image = image.add_local_file(HERE / f, f"/app/{f}")
+    if (HERE / f).exists():
+        image = image.add_local_file(HERE / f, f"/app/{f}")
+filter_image = image
+for f in POOL:
+    if (HERE / f).exists():
+        filter_image = filter_image.add_local_file(HERE / f, f"/app/{f}")
 
 app = modal.App("neutron-fim-bakeoff", image=image)
 hf_cache = modal.Volume.from_name("neutron-hf-cache", create_if_missing=True)
@@ -81,13 +92,15 @@ def _stop(proc: subprocess.Popen):
 
 @app.function(gpu="A10G", timeout=3 * 3600, secrets=[modal.Secret.from_name("huggingface")],
               volumes={"/root/.cache/huggingface": hf_cache})
-def bakeoff(models: list[str], hf_repo: str) -> str:
+def bakeoff(models: list[str], hf_repo: str, data: str = "fim_holdout.jsonl") -> str:
     from huggingface_hub import HfApi
 
     os.chdir("/app")
     sys.path.insert(0, "/app")
     import fim
 
+    # Original test set keeps its old upload path so earlier results stay comparable; others get a subfolder.
+    folder = "fim_bakeoff" if data == "fim_holdout.jsonl" else f"fim_bakeoff/{pathlib.Path(data).stem}"
     lines = []
     for model in models:
         tag = re.sub(r"[^A-Za-z0-9._-]+", "_", model.split("/")[-1])
@@ -100,22 +113,67 @@ def bakeoff(models: list[str], hf_repo: str) -> str:
         try:
             hf_cache.commit()
             report = f"/tmp/fim_{tag}.jsonl"
-            score = fim.eval_fim("fim_holdout.jsonl", "http://localhost:8000/v1/completions", model, "", "completions",
+            score = fim.eval_fim(data, "http://localhost:8000/v1/completions", model, "", "completions",
                                  workers=24, limit=0, report=report)
             lines.append(f"{model}: FIM pass@1 {score:.1%}")
             if hf_repo:
-                HfApi().upload_file(path_or_fileobj=report, path_in_repo=f"fim_bakeoff/{tag}.jsonl", repo_id=hf_repo,
+                HfApi().upload_file(path_or_fileobj=report, path_in_repo=f"{folder}/{tag}.jsonl", repo_id=hf_repo,
                                     repo_type="dataset")
         finally:
             _stop(server)
     summary = "\n".join(lines)
-    print("\n=== Quark bake-off ===\n" + summary, flush=True)
+    print(f"\n=== Quark bake-off ({data}) ===\n" + summary, flush=True)
     return summary
 
 
+@app.function(gpu="A10G", cpu=8, timeout=4 * 3600, secrets=[modal.Secret.from_name("huggingface")],
+              volumes={"/root/.cache/huggingface": hf_cache}, image=filter_image)
+def filter_holes(model: str, samples: int, hf_repo: str, out_name: str) -> str:
+    from huggingface_hub import HfApi
+
+    os.chdir("/app")
+    sys.path.insert(0, "/app")
+    import fim
+
+    seen, pool = set(), []
+    for f in POOL:
+        if os.path.exists(f):
+            for line in open(f, encoding="utf-8"):
+                if line.strip() and (task_id := json.loads(line)["id"]) not in seen:
+                    seen.add(task_id)
+                    pool.append(line if line.endswith("\n") else line + "\n")
+    with open("/tmp/pool.jsonl", "w", encoding="utf-8") as fo:
+        fo.writelines(pool)
+    print(f"Scoring {len(pool)} holes x {samples} answers with {model}", flush=True)
+    server = _serve(model)
+    try:
+        hf_cache.commit()
+        fim.filter_fim("/tmp/pool.jsonl", f"/tmp/{out_name}", "http://localhost:8000/v1/completions", model,
+                       samples=samples, temperature=0.8, workers=24)
+    finally:
+        _stop(server)
+    if hf_repo:
+        HfApi().upload_file(path_or_fileobj=f"/tmp/{out_name}", path_in_repo=f"fim/{out_name}", repo_id=hf_repo,
+                            repo_type="dataset")
+    return open(f"/tmp/{out_name}", encoding="utf-8").read()
+
+
 @app.local_entrypoint()
-def main(models: str = DEFAULT_MODELS, gpu: str = "A10G", hf_repo: str = "neutronai-code/hadron-data"):
-    n_tasks = sum(1 for line in open(HERE / "fim_holdout.jsonl", encoding="utf-8") if line.strip())
+def main(models: str = DEFAULT_MODELS, gpu: str = "A10G", hf_repo: str = "neutronai-code/hadron-data",
+         data: str = "fim_holdout.jsonl", filter: bool = False, samples: int = 4, out: str = "fim_train_v2.jsonl"):
     model_list = [m.strip() for m in models.split(",") if m.strip()]
-    print(f"FIM bake-off on {gpu}: {len(model_list)} models x {n_tasks} held-out fill-in tasks")
-    print("\n" + bakeoff.with_options(gpu=gpu).remote(model_list, hf_repo))
+    if filter:  # difficulty filter for the next training round, scored by ONE model (the one being trained further)
+        missing = [f for f in POOL if not (HERE / f).exists()]
+        if missing:
+            raise SystemExit(f"Missing {missing}. Mine the longer holes first: uv run fim.py mine --hard --source "
+                             "tasks_generated.jsonl --out fim_hard_pool.jsonl --holdout-out fim_holdout_hard.jsonl")
+        if len(model_list) != 1:
+            raise SystemExit("--filter needs exactly one model, e.g. --models neutronai-code/Quark-1.5B-v0.1")
+        text = filter_holes.with_options(gpu=gpu).remote(model_list[0], samples, hf_repo, out)
+        (HERE / out).write_text(text, encoding="utf-8")
+        n = sum(1 for line in text.splitlines() if line.strip())
+        print(f"\nWrote {n} training holes -> {out}. Train the next Quark on it with --steps {n}.")
+        return
+    n_tasks = sum(1 for line in open(HERE / data, encoding="utf-8") if line.strip())
+    print(f"FIM bake-off on {gpu}: {len(model_list)} models x {n_tasks} held-out fill-in tasks ({data})")
+    print("\n" + bakeoff.with_options(gpu=gpu).remote(model_list, hf_repo, data))
