@@ -31,8 +31,8 @@ def _(mo, start, token):
     # Stage 1 (v0.6): Mellum2 base -> one pass over fim_v05 (59.4k rows / 16 rows per step).
     # Stage 2 (v0.7): v0.6's merged model -> one pass over fim_v06 (120k new holes, other seed). Swap the comments.
     # Each stage resumes from its own REPO/last-checkpoint, so rerunning after a shutdown continues where it was.
-    MODEL, DATA, STEPS, REPO = "JetBrains/Mellum2-12B-A2.5B-Base", "fim_v05.jsonl", 3714, "neutronai-code/Quark-12B-A2.5B-v0.6"
-    # MODEL, DATA, STEPS, REPO = "neutronai-code/Quark-12B-A2.5B-v0.6", "fim_v06.jsonl", 7456, "neutronai-code/Quark-12B-A2.5B-v0.7"
+    # MODEL, DATA, STEPS, REPO = "JetBrains/Mellum2-12B-A2.5B-Base", "fim_v05.jsonl", 3714, "neutronai-code/Quark-12B-A2.5B-v0.6"
+    MODEL, DATA, STEPS, REPO = "neutronai-code/Quark-12B-A2.5B-v0.6", "fim_v06.jsonl", 7456, "neutronai-code/Quark-12B-A2.5B-v0.7"
     MAX_MIN = 600  # stop training after 10 h, so merging + uploading fits in molab's 12 h session
     work = os.path.abspath("quark_work")
     os.makedirs(work, exist_ok=True)
