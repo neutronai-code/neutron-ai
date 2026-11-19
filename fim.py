@@ -302,10 +302,16 @@ def fim_style(model: str) -> str:
         try:
             from huggingface_hub import hf_hub_download
 
-            with open(hf_hub_download(model, "tokenizer_config.json"), encoding="utf-8") as f:
-                tok = f.read()
-            _FIM_STYLE[model] = ("starcoder" if '"<fim_prefix>"' in tok else
-                                 "granite" if '"<|filename|>"' in tok else "qwen")
+            # tokenizer_config.json first (small), then tokenizer.json: transformers 5 saves fine-tunes' configs without
+            # their special-token list, so a Mellum fine-tune's `<fim_prefix>` only shows in tokenizer.json.
+            style = "qwen"
+            for name in ("tokenizer_config.json", "tokenizer.json"):
+                with open(hf_hub_download(model, name), encoding="utf-8") as f:
+                    tok = f.read()
+                if '"<fim_prefix>"' in tok or '"<|filename|>"' in tok:
+                    style = "starcoder" if '"<fim_prefix>"' in tok else "granite"
+                    break
+            _FIM_STYLE[model] = style
         except Exception:
             _FIM_STYLE[model] = "starcoder" if "mellum" in model.lower() else "qwen"
     return _FIM_STYLE[model]

@@ -22,6 +22,10 @@ v0.5: the same rows, but the context is ctx_gather.py's name-based context (what
 the names near the cursor, the enclosing class, the file's outline, what the imports provide) in most hole rows:
   uv run python quark_data_v04.py --ctx names --ctx-share 0.7 --ctx-chars 4000 --tag v05 --seed 1 \\
       --rows 60000 --out fim_v05.jsonl
+
+v0.6 data (for the Quark-12B v0.7 run): the same recipe, twice the rows and other holes (0.2% overlap with v0.5):
+  uv run python quark_data_v04.py --ctx names --ctx-share 0.7 --ctx-chars 4000 --tag v06 --seed 2 \\
+      --rows 120000 --out fim_v06.jsonl
 """
 import argparse
 import collections
