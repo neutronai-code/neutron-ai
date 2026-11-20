@@ -1,0 +1,215 @@
+"""The real-repo FIM benchmark's tests on this Linux machine (e.g. molab's free CPUs) instead of Modal containers.
+
+Same scoring as `modal_repo_fim.py --eval`: an empty fill fails, a fill identical to the original passes, every other
+fill is spliced into the real file at the repo's pinned commit and that repo's own tests decide. Needs no root: Node 24
+(the official build), GCC 14, CMake, Ninja, git and uv come from nodejs.org / conda-forge into --tools.
+
+  python local_repo_eval.py --data repo_holes_ctx2.jsonl --fills repo_eval_report_q12v07.fills.json \
+      --report repo_eval_report_ctx2.jsonl
+  (--fills is modal_repo_fim's fills cache: {"key": {...}, "fills": {model: [fill per hole]}}; --limit 3 for a smoke
+  test; --repos owner/name,... for some repos only)
+
+The report keeps every earlier model's results, so the table shows the new model next to them.
+"""
+import argparse
+import collections
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import repo_fim  # noqa: E402
+
+
+def _download(url: str, path: str) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": "neutron-bench"})
+    with urllib.request.urlopen(req, timeout=300) as r, open(path, "wb") as f:
+        shutil.copyfileobj(r, f)
+    return path
+
+
+def setup_toolchain(tools: str, log=print) -> None:
+    """Install the test toolchain under `tools` (once) and point this process's environment at it, so every
+    repo_fim.run() subprocess sees it. Matches modal_repo_fim's image: Node 24 + corepack, GCC 14, CMake, Ninja, uv."""
+    os.makedirs(tools, exist_ok=True)
+    node, env, shims = f"{tools}/node", f"{tools}/env", f"{tools}/shims"
+    if not os.path.exists(f"{node}/bin/node"):
+        base = "https://nodejs.org/dist/latest-v24.x/"
+        sums = urllib.request.urlopen(urllib.request.Request(base + "SHASUMS256.txt",
+                                                             headers={"User-Agent": "neutron-bench"})).read().decode()
+        name = re.search(r"node-v24[\d.]+-linux-x64\.tar\.xz", sums).group(0)
+        log(f"[tools] {name}")
+        tarfile.open(_download(base + name, f"{tools}/node.tar.xz")).extractall(tools)
+        os.rename(f"{tools}/{name[:-len('.tar.xz')]}", node)
+        os.remove(f"{tools}/node.tar.xz")
+    if not os.path.exists(f"{env}/bin/cmake"):
+        log("[tools] micromamba: GCC 14, CMake, Ninja, git, uv from conda-forge (a few minutes)")
+        mm = f"{tools}/micromamba"
+        tarfile.open(_download("https://micro.mamba.pm/api/micromamba/linux-64/latest", f"{mm}.tar.bz2")).extractall(mm)
+        r = subprocess.run([f"{mm}/bin/micromamba", "create", "-y", "-q", "-p", env, "-c", "conda-forge",
+                            "--override-channels", "gcc_linux-64=14", "gxx_linux-64=14", "cmake", "ninja", "git", "uv",
+                            "make", "pkg-config", "python=3.12"],  # 3.12: the Python uv found on Modal
+                           env=dict(os.environ, MAMBA_ROOT_PREFIX=f"{tools}/mamba"), capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError("micromamba failed:\n" + (r.stdout + r.stderr)[-3000:])
+    os.makedirs(shims, exist_ok=True)  # plain names for build scripts that don't read CC / CXX (conda's are prefixed)
+    for short, full in (("gcc", "gcc"), ("cc", "gcc"), ("gcc-14", "gcc"), ("g++", "g++"), ("c++", "g++"),
+                        ("g++-14", "g++"), ("ar", "ar"), ("ranlib", "ranlib"), ("ld", "ld"), ("nm", "nm"),
+                        ("strip", "strip")):
+        if not os.path.lexists(f"{shims}/{short}"):
+            os.symlink(f"{env}/bin/x86_64-conda-linux-gnu-{full}", f"{shims}/{short}")
+    home = f"{tools}/home"  # caches go here: the notebook user's own home may not be writable
+    os.makedirs(home, exist_ok=True)
+    os.environ.update({
+        "PATH": f"{shims}:{node}/bin:{env}/bin:" + os.environ.get("PATH", ""),
+        "CC": f"{env}/bin/x86_64-conda-linux-gnu-gcc", "CXX": f"{env}/bin/x86_64-conda-linux-gnu-g++",
+        # conda's GCC 14 brings a newer libstdc++ than the system's: test binaries must load that one
+        "LDFLAGS": f"-Wl,-rpath,{env}/lib", "HOME": home, "XDG_CACHE_HOME": f"{home}/.cache",
+        "XDG_DATA_HOME": f"{home}/.local/share", "npm_config_cache": f"{home}/.npm", "COREPACK_HOME": f"{home}/corepack",
+        "UV_CACHE_DIR": f"{home}/.cache/uv", "UV_PYTHON_INSTALL_DIR": f"{home}/uv-python",
+        # the rest as in modal_repo_fim's image
+        "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0", "CI": "1", "UV_LINK_MODE": "copy", "TZ": "UTC", "UV_TORCH_BACKEND": "cpu",
+        # C++ builds: 2 compile jobs each, since several repos build at once (Ninja would otherwise start one per
+        # core it can see, which in a container can be the whole host's)
+        "CMAKE_BUILD_PARALLEL_LEVEL": "2",
+    })
+    for k in ("CFLAGS", "CXXFLAGS", "CPPFLAGS", "VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME"):
+        os.environ.pop(k, None)
+    if not os.path.exists(f"{node}/bin/pnpm"):
+        ok, _, tail = repo_fim.run("corepack enable", tools, 120)
+        if not ok:
+            raise RuntimeError(f"corepack enable failed:\n{tail}")
+    ok, _, tail = repo_fim.run("node --version && g++ --version | head -1 && cmake --version | head -1 && "
+                               "uv --version && git --version", tools, 120)
+    if not ok:
+        raise RuntimeError(f"toolchain check failed:\n{tail}")
+    log("[tools] " + " | ".join(tail.splitlines()))
+
+
+def _checkout(info: dict, root: str) -> None:
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root)
+    ok, _, tail = repo_fim.run(f"git init -q && git remote add origin {info['url']} && "
+                               f"git fetch -q --depth 1 origin {info['commit']} && git checkout -q FETCH_HEAD",
+                               root, 600)
+    if not ok:
+        raise RuntimeError(f"clone failed: {tail}")
+
+
+def _check_batch(repo: str, info: dict, fills: list[tuple[str, int, int, str]], root: str, log) -> list[bool | None]:
+    """modal_repo_fim.check on this machine: install the repo, confirm its tests pass, then test each fill.
+    A repo that won't install or pass its own tests gives None ("couldn't test") for its fills."""
+    cfg = repo_fim.REPOS[repo]
+    try:
+        _checkout(info, root)
+        ok, _, tail = repo_fim.run(cfg["setup"], root, 30 * 60)
+        if not ok:
+            raise RuntimeError(f"setup failed:\n{tail}")
+        for _ in range(3):  # a flaky test shouldn't sink a whole batch
+            ok, secs, tail = repo_fim.run(cfg["test"], root, 15 * 60)
+            if ok:
+                break
+        if not ok:
+            raise RuntimeError(f"the original code's tests fail:\n{tail}")
+        timeout = max(60.0, 3 * secs + 30)
+        out = [repo_fim.check_fill(root, path, lo, hi, middle, cfg["test"], timeout)[0]
+               for path, lo, hi, middle in fills]
+        log(f"[{repo}] {sum(out)}/{len(out)} fills pass")
+        return out
+    except Exception as e:
+        log(f"!! [{repo}] {len(fills)} fills could NOT be tested: {e}")
+        return [None] * len(fills)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def evaluate(rows: list[dict], fills: dict[str, list[str]], info: dict, work: str, workers: int = 4, chunk: int = 12,
+             log=print) -> dict[tuple[str, int], bool | None]:
+    """(model, hole index) -> passed (None: couldn't be tested). Batches of `chunk` fills from one repo run in
+    parallel, each in its own fresh checkout, slowest repos first."""
+    passed, jobs = {}, collections.defaultdict(list)
+    for model, mids in fills.items():
+        for i, (r, mid) in enumerate(zip(rows, mids)):
+            if not mid.strip():
+                passed[model, i] = False
+            elif repo_fim.same_code(mid, r["oracle_middle"]):
+                passed[model, i] = True
+            else:
+                jobs[r["repo"]].append((model, i, (r["path"], r["lo"], r["hi"], mid)))
+    batches = [(repo, js[k:k + chunk]) for repo, js in jobs.items() for k in range(0, len(js), chunk)]
+    slow = {"EbodShojaei/bake": 54, "MichielMe/fastscheduler": 27, "meodai/heerich": 12}  # test seconds, from mining
+    batches.sort(key=lambda b: -len(b[1]) * slow.get(b[0], 8))
+    log(f"{sum(passed.values())} fills match the original exactly; testing {sum(len(b) for _, b in batches)} others "
+        f"in {len(batches)} batches, {workers} at a time")
+    t0, done = time.time(), [0]
+
+    def run(k):
+        repo, b = batches[k]
+        res = _check_batch(repo, info[repo], [j[2] for j in b], f"{work}/b{k}_{repo.replace('/', '__')}", log)
+        done[0] += 1
+        log(f"   {done[0]}/{len(batches)} batches done ({(time.time() - t0) / 60:.0f} min)")
+        return res
+
+    with ThreadPoolExecutor(workers) as pool:
+        for (repo, b), res in zip(batches, pool.map(run, range(len(batches)))):
+            for (model, i, _), ok in zip(b, res):
+                passed[model, i] = ok
+    return passed
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--data", required=True, help="the holes, e.g. repo_holes_ctx2.jsonl")
+    ap.add_argument("--fills", required=True, help="fills cache JSON: {'key': ..., 'fills': {model: [...]}}")
+    ap.add_argument("--report", required=True, help="per-hole report to merge the results into")
+    ap.add_argument("--repo-info", default=os.path.join(HERE, "quark_repos.jsonl"))
+    ap.add_argument("--tools", default="/tmp/quark_tools")
+    ap.add_argument("--work", default="/tmp/quark_bench")
+    ap.add_argument("--workers", type=int, default=max(1, os.cpu_count() or 1))
+    ap.add_argument("--repos", default="")
+    ap.add_argument("--limit", type=int, default=0, help="smoke test: only the first N holes of each repo")
+    ap.add_argument("--show", type=int, default=0, help="table: only the best N earlier models (0: all)")
+    args = ap.parse_args()
+    log = lambda m: print(m, flush=True)
+
+    rows = [json.loads(line) for line in open(args.data, encoding="utf-8") if line.strip()]
+    saved = json.load(open(args.fills, encoding="utf-8"))
+    if saved["key"]["ids"] != [r["id"] for r in rows]:
+        raise SystemExit(f"{args.fills} was made for other holes than {args.data}")
+    keep = list(range(len(rows)))
+    repos = [r.strip() for r in args.repos.split(",") if r.strip()]
+    if repos:
+        keep = [i for i in keep if rows[i]["repo"] in repos]
+    if args.limit:
+        per = collections.Counter()
+        keep = [i for i in keep if (per.update([rows[i]["repo"]]) or per[rows[i]["repo"]] <= args.limit)]
+    rows = [rows[i] for i in keep]
+    fills = {m: [f[i] for i in keep] for m, f in saved["fills"].items()}
+    log(f"Real-repo FIM benchmark on this machine: {len(fills)} model(s) x {len(rows)} holes, "
+        f"{len({r['repo'] for r in rows})} repos")
+
+    setup_toolchain(args.tools, log)
+    t0 = time.time()
+    passed = evaluate(rows, fills, repo_fim.load_repo_info(args.repo_info), args.work, args.workers, log=log)
+    untested = sum(v is None for v in passed.values())
+    log(f"tests took {(time.time() - t0) / 60:.0f} min")
+
+    records = [{"model": m, "id": r["id"], "repo": r["repo"], "lang": r["lang"], "size": r["size"],
+                "pass": bool(passed[m, i]), "completion": fills[m][i]} for m in fills for i, r in enumerate(rows)]
+    repo_fim.print_tables(repo_fim.merge_report(args.report, records), list(fills), args.show)
+    if untested:
+        log(f"\n!! {untested} fills could not be tested (see the '!!' lines above) and count as failed: the score is "
+            f"too low until those repos work here")
+    log(f"\nPer-hole results -> {args.report}")
+
+
+if __name__ == "__main__":
+    main()

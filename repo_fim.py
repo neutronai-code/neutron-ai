@@ -323,6 +323,56 @@ def same_code(a: str, b: str) -> bool:
     return norm(a) == norm(b)
 
 
+def merge_report(path: str, records: list[dict]) -> list[dict]:
+    """Write `records` into the per-hole report at `path`, keeping other models' results and replacing only the
+    (model, hole) pairs in `records`. Returns everything now in the report."""
+    p = Path(path)
+    if p.exists():
+        redone = {(x["model"], x["id"]) for x in records}
+        old = [json.loads(line) for line in open(p, encoding="utf-8") if line.strip()]
+        records = [x for x in old if (x["model"], x["id"]) not in redone] + records
+    with open(p, "w", encoding="utf-8") as f:
+        f.writelines(json.dumps(x) + "\n" for x in records)
+    return records
+
+
+def print_tables(records: list[dict], models: list[str], max_others: int = 0) -> None:
+    """Pass rates by language / hole size / repo for `models`, next to every earlier model in `records` that was
+    scored on the same holes (only the best `max_others` of them, if set), then each new model's wins and losses
+    against those models, hole by hole."""
+    import collections
+
+    res = collections.defaultdict(dict)  # model -> hole id -> record
+    for x in records:
+        res[x["model"]][x["id"]] = x
+    ids = sorted(set.intersection(*(set(res[m]) for m in models)))
+    others = [m for m in res if m not in models and set(ids) <= set(res[m])]
+    if max_others:
+        best = sorted(others, key=lambda o: -sum(res[o][i]["pass"] for i in ids))[:max_others]
+        others = [o for o in others if o in best]
+    shown = others + models
+
+    def table(title, field):
+        groups = sorted({res[models[0]][i][field] for i in ids})
+        tags = [m.split("/")[-1] for m in shown]
+        print(f"\n{title:28}" + "".join(f"{t[-22:]:>24}" for t in tags))  # the end: version / @commit
+        for g in groups + ["ALL"]:
+            sel = [i for i in ids if g == "ALL" or res[models[0]][i][field] == g]
+            cells = "".join(f"{sum(res[m][i]['pass'] for i in sel) / len(sel):>17.1%} ({len(sel):>3})" for m in shown)
+            print(f"{str(g)[:28]:28}{cells}")
+
+    table("language", "lang")
+    table("hole size", "size")
+    table("repo", "repo")
+    for m in models:
+        if others:
+            print(f"\n{m.split('/')[-1]} hole by hole (wins / losses):")
+        for o in sorted(others, key=lambda o: -sum(res[o][i]["pass"] for i in ids)):
+            wins = sum(res[m][i]["pass"] and not res[o][i]["pass"] for i in ids)
+            losses = sum(res[o][i]["pass"] and not res[m][i]["pass"] for i in ids)
+            print(f"  vs {o.split('/')[-1]:34} {wins:>4} / {losses:<4}")
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # SFT warm-up data (Quark v0.3). The answer to an SFT hole is just the original code, so these holes need no test runs:
 # we can cut thousands of them. The first 10 repos stay out of training: their 600 test-checked holes are the benchmark.

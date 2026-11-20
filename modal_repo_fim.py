@@ -247,32 +247,8 @@ def run_eval(models: list[str], data: str, chunk: int, limit: int, repos: list[s
     records = [{"model": model, "id": r["id"], "repo": r["repo"], "lang": r["lang"], "size": r["size"],
                 "pass": passed[model, i], "completion": fills[model][i]}
                for model in models for i, r in enumerate(rows)]
-    if report.exists():  # keep earlier models' results; replace only the (model, hole) pairs just re-run
-        redone = {(x["model"], x["id"]) for x in records}
-        old = [json.loads(line) for line in open(report, encoding="utf-8") if line.strip()]
-        records = [x for x in old if (x["model"], x["id"]) not in redone] + records
-    with open(report, "w", encoding="utf-8") as f:
-        f.writelines(json.dumps(x) + "\n" for x in records)
-
-    res = collections.defaultdict(dict)  # model -> hole id -> record, over every repo in the report
-    for x in records:
-        res[x["model"]][x["id"]] = x
-    ids = sorted(set.intersection(*(set(res[m]) for m in models)))
-    # Show earlier models that were scored on all the same holes too, so one new model is compared at a glance.
-    models = [m for m in res if m not in models and set(ids) <= set(res[m])] + models
-
-    def table(title, field):
-        groups = sorted({res[models[0]][i][field] for i in ids})
-        tags = [m.split("/")[-1] for m in models]
-        print(f"\n{title:28}" + "".join(f"{t[:22]:>24}" for t in tags))
-        for g in groups + ["ALL"]:
-            sel = [i for i in ids if g == "ALL" or res[models[0]][i][field] == g]
-            cells = "".join(f"{sum(res[m][i]['pass'] for i in sel) / len(sel):>17.1%} ({len(sel):>3})" for m in models)
-            print(f"{str(g)[:28]:28}{cells}")
-
-    table("language", "lang")
-    table("hole size", "size")
-    table("repo", "repo")
+    # Keep earlier models' results (replace only the pairs just re-run) and show them next to the new ones.
+    repo_fim.print_tables(repo_fim.merge_report(str(report), records), models)
     print(f"\nPer-hole results -> {report.name}")
 
 
