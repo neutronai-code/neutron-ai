@@ -148,6 +148,34 @@ def _check_batch(repo: str, info: dict, fills: list[tuple[str, int, int, str]], 
         shutil.rmtree(c, ignore_errors=True)
 
 
+def _stop_older_runs(work: str, log) -> None:
+    """Stop any other copy of this script and the tests it left running, then clear `work`. Restarting a notebook
+    that stopped responding doesn't stop a test run it started: the old run keeps going next to the new one, both
+    use the same batch folders (b0_..., b1_...), and each wipes the other's checkouts mid-test. On molab that
+    turned 5 passing bake fills into fails and doubled the load."""
+    import signal
+
+    me, n = os.getpid(), 0
+    for pid in os.listdir("/proc") if os.path.isdir("/proc") else []:
+        if not pid.isdigit() or int(pid) in (me, os.getppid()):
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().split(b"\0")
+            if any(a.endswith(b"local_repo_eval.py") for a in cmd):
+                os.kill(int(pid), signal.SIGKILL)
+                n += 1
+        except OSError:
+            pass
+    if n:
+        time.sleep(2)
+        log(f"stopped {n} older run(s) of local_repo_eval.py (left over from a restarted notebook)")
+    n = _kill_inside(work)
+    if n:
+        log(f"stopped {n} leftover test process(es) in {work}")
+    shutil.rmtree(work, ignore_errors=True)
+
+
 def _kill_inside(root: str) -> int:
     """Kill processes still running inside `root` (their working directory is there): tests that started a server
     or a worker in a new session escape repo_fim.run's process-group kill. Returns how many."""
@@ -263,7 +291,7 @@ def evaluate(rows: list[dict], fills: dict[str, list[str]], info: dict, work: st
     parallel, each in its own fresh checkout, slowest repos first. Each finished batch is appended to `progress`
     (if given), and a rerun skips the fills already tested there, so a restarted notebook continues."""
     done_before = {}
-    if progress and hub_progress and not os.path.exists(progress):
+    if progress and hub_progress:  # the hub copy counts (it gets every batch too), so it can be corrected there
         _hub(hub_progress, progress, upload=False)
     if progress and os.path.exists(progress):
         for line in open(progress, encoding="utf-8"):
@@ -398,6 +426,7 @@ def main():
     log(f"Real-repo FIM benchmark on this machine: {len(fills)} model(s) x {len(rows)} holes, "
         f"{len({r['repo'] for r in rows})} repos")
 
+    _stop_older_runs(args.work, log)
     setup_toolchain(args.tools, log)
     log("machine: " + _machine()[2])
     log("limits: " + _limits())
