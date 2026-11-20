@@ -33,7 +33,10 @@ def _(mo, start, token):
     # Each stage resumes from its own REPO/last-checkpoint, so rerunning after a shutdown continues where it was.
     # MODEL, DATA, STEPS, REPO = "JetBrains/Mellum2-12B-A2.5B-Base", "fim_v05.jsonl", 3714, "neutronai-code/Quark-12B-A2.5B-v0.6"
     MODEL, DATA, STEPS, REPO = "neutronai-code/Quark-12B-A2.5B-v0.6", "fim_v06.jsonl", 7456, "neutronai-code/Quark-12B-A2.5B-v0.7"
-    MAX_MIN = 600  # stop training after 10 h, so merging + uploading fits in molab's 12 h session
+    # Stop training after 11 h 20 min: setup takes ~15 min and the final save + merge + upload ~5 min, so this leaves
+    # ~20 min spare before molab's 12 h session limit. (A hard stop would still lose at most 100 steps: every
+    # checkpoint goes to REPO/last-checkpoint.)
+    MAX_MIN = 680
     work = os.path.abspath("quark_work")
     os.makedirs(work, exist_ok=True)
 

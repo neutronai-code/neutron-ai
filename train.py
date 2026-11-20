@@ -242,11 +242,23 @@ def _make_hub_checkpoint_callback(repo_id: str):
 
 
 def _find_resume_checkpoint(out_dir: str, repo_id: str) -> str | None:
-    """Latest local checkpoint in out_dir, else the hub's last-checkpoint (downloaded), else None."""
+    """Latest complete local checkpoint in out_dir, else the hub's last-checkpoint (downloaded), else None.
+    A local checkpoint without weights (a save cut short, or a notebook disk that dropped the big files after a
+    restart, as happened on molab) is skipped, and the hub copy is used instead."""
+    def complete(path: str) -> bool:
+        names = set(os.listdir(path))
+        weights = {"adapter_model.safetensors", "adapter_model.bin", "model.safetensors", "pytorch_model.bin",
+                   "model.safetensors.index.json", "pytorch_model.bin.index.json"}
+        return "trainer_state.json" in names and bool(names & weights) and all(
+            os.path.getsize(os.path.join(path, n)) > 0 for n in names & weights)
+
     if os.path.isdir(out_dir):
-        ckpts = sorted((d for d in os.listdir(out_dir) if d.startswith("checkpoint-")), key=lambda d: int(d.split("-")[1]))
-        if ckpts:
-            return os.path.join(out_dir, ckpts[-1])
+        ckpts = sorted((d for d in os.listdir(out_dir) if re.fullmatch(r"checkpoint-\d+", d)),
+                       key=lambda d: int(d.split("-")[1]))
+        for d in reversed(ckpts):
+            if complete(os.path.join(out_dir, d)):
+                return os.path.join(out_dir, d)
+            print(f"[NeutronAI] skipping incomplete local {d}", flush=True)
     if repo_id:
         from huggingface_hub import snapshot_download
 
