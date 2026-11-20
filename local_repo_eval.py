@@ -188,12 +188,20 @@ def _machine() -> tuple[float, float, str]:
     avail = int(info.get("MemAvailable", "0 kB").split()[0]) * 1024
     used_b = int(used) - cache if used.isdigit() else total - avail
     limit_b = int(limit) if limit.isdigit() and int(limit) < total else total
-    procs = sum(p.isdigit() for p in os.listdir("/proc")) if os.path.isdir("/proc") else 0
+    # The processes' own memory, added up: on molab the RAM line above stayed ~1 GB with 100 Node processes
+    # running, so it misses most of it.
+    pids = [p for p in os.listdir("/proc") if p.isdigit()] if os.path.isdir("/proc") else []
+    rss = 0
+    for p in pids:
+        for line in read(f"/proc/{p}/status").splitlines():
+            if line.startswith("VmRSS:"):
+                rss += int(line.split()[1]) * 1024
+    used_b = max(used_b, rss)
     tmp = shutil.disk_usage("/tmp").used if os.path.isdir("/tmp") else 0
     if MEM_GB:
         used_b, limit_b = used_b + tmp, MEM_GB * 1e9
-    status = (f"memory {used_b / 1e9:.1f}/{limit_b / 1e9:.0f} GB" + (" (RAM + /tmp files)" if MEM_GB else "")
-              + f" | /tmp {tmp / 1e9:.1f} GB | {procs} processes")
+    status = (f"memory {used_b / 1e9:.1f}/{limit_b / 1e9:.0f} GB" + (" (processes + /tmp files)" if MEM_GB else "")
+              + f" | processes {rss / 1e9:.1f} GB in {len(pids)} | /tmp {tmp / 1e9:.1f} GB")
     return used_b / 1e9, limit_b / 1e9, status
 
 
