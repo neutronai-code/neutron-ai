@@ -187,7 +187,9 @@ def _(mo, start, token):
     test_log = os.path.join(work, "tests.log")
     proc = subprocess.Popen([sys.executable, "-u", "local_repo_eval.py", "--data", os.path.join(work, BENCH),
                              "--fills", fills_path, "--report", report, "--repo-info", info,
-                             "--workers", str(WORKERS), "--limit", str(LIMIT), "--show", "4"],
+                             "--workers", str(WORKERS), "--limit", str(LIMIT), "--show", "4",
+                             # finished batches: rerunning after a restart continues instead of starting over
+                             "--progress", os.path.join(work, "test_progress.jsonl")],
                             cwd=code, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
     with open(test_log, "w") as _log:
         for line in proc.stdout:

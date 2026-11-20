@@ -15,11 +15,13 @@ import argparse
 import collections
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -47,13 +49,13 @@ def setup_toolchain(tools: str, log=print) -> None:
                                                              headers={"User-Agent": "neutron-bench"})).read().decode()
         name = re.search(r"node-v24[\d.]+-linux-x64\.tar\.xz", sums).group(0)
         log(f"[tools] {name}")
-        tarfile.open(_download(base + name, f"{tools}/node.tar.xz")).extractall(tools)
+        tarfile.open(_download(base + name, f"{tools}/node.tar.xz")).extractall(tools, filter="tar")
         os.rename(f"{tools}/{name[:-len('.tar.xz')]}", node)
         os.remove(f"{tools}/node.tar.xz")
     if not os.path.exists(f"{env}/bin/cmake"):
         log("[tools] micromamba: GCC 14, CMake, Ninja, git, uv from conda-forge (a few minutes)")
         mm = f"{tools}/micromamba"
-        tarfile.open(_download("https://micro.mamba.pm/api/micromamba/linux-64/latest", f"{mm}.tar.bz2")).extractall(mm)
+        tarfile.open(_download("https://micro.mamba.pm/api/micromamba/linux-64/latest", f"{mm}.tar.bz2")).extractall(mm, filter="tar")
         r = subprocess.run([f"{mm}/bin/micromamba", "create", "-y", "-q", "-p", env, "-c", "conda-forge",
                             "--override-channels", "gcc_linux-64=14", "gxx_linux-64=14", "cmake", "ninja", "git", "uv",
                             "make", "pkg-config", "python=3.12"],  # 3.12: the Python uv found on Modal
@@ -132,9 +134,16 @@ def _check_batch(repo: str, info: dict, fills: list[tuple[str, int, int, str]], 
 
 
 def evaluate(rows: list[dict], fills: dict[str, list[str]], info: dict, work: str, workers: int = 4, chunk: int = 12,
-             log=print) -> dict[tuple[str, int], bool | None]:
+             progress: str = "", log=print) -> dict[tuple[str, int], bool | None]:
     """(model, hole index) -> passed (None: couldn't be tested). Batches of `chunk` fills from one repo run in
-    parallel, each in its own fresh checkout, slowest repos first."""
+    parallel, each in its own fresh checkout, slowest repos first. Each finished batch is appended to `progress`
+    (if given), and a rerun skips the fills already tested there, so a restarted notebook continues."""
+    done_before = {}
+    if progress and os.path.exists(progress):
+        for line in open(progress, encoding="utf-8"):
+            x = json.loads(line)
+            if x["pass"] is not None:
+                done_before[x["model"], x["id"], x["fill"]] = x["pass"]
     passed, jobs = {}, collections.defaultdict(list)
     for model, mids in fills.items():
         for i, (r, mid) in enumerate(zip(rows, mids)):
@@ -142,19 +151,41 @@ def evaluate(rows: list[dict], fills: dict[str, list[str]], info: dict, work: st
                 passed[model, i] = False
             elif repo_fim.same_code(mid, r["oracle_middle"]):
                 passed[model, i] = True
+            elif (model, r["id"], mid) in done_before:
+                passed[model, i] = done_before[model, r["id"], mid]
             else:
                 jobs[r["repo"]].append((model, i, (r["path"], r["lo"], r["hi"], mid)))
     batches = [(repo, js[k:k + chunk]) for repo, js in jobs.items() for k in range(0, len(js), chunk)]
     slow = {"EbodShojaei/bake": 54, "MichielMe/fastscheduler": 27, "meodai/heerich": 12}  # test seconds, from mining
     batches.sort(key=lambda b: -len(b[1]) * slow.get(b[0], 8))
-    log(f"{sum(passed.values())} fills match the original exactly; testing {sum(len(b) for _, b in batches)} others "
-        f"in {len(batches)} batches, {workers} at a time")
-    t0, done = time.time(), [0]
+    if done_before:
+        log(f"{len(done_before)} fills were already tested in an earlier run (from {progress})")
+    log(f"{sum(passed.values())} fills pass without a new test run (exact or tested before); testing "
+        f"{sum(len(b) for _, b in batches)} others in {len(batches)} batches, {workers} at a time")
+    t0, done, lock = time.time(), [0], threading.Lock()
+    # One CPU per batch: test runners such as vitest start a worker per CPU they can see, and in a container that can
+    # be every core of the host machine, so 4 batches at once could start dozens of workers and freeze the notebook.
+    # Linux's affinity is per thread, and the tests started from this thread inherit it.
+    cpus = queue.Queue()
+    allowed = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else [None]
+    for k in range(workers):
+        cpus.put(allowed[k % len(allowed)])
 
     def run(k):
         repo, b = batches[k]
-        res = _check_batch(repo, info[repo], [j[2] for j in b], f"{work}/b{k}_{repo.replace('/', '__')}", log)
-        done[0] += 1
+        cpu = cpus.get()
+        try:
+            if cpu is not None:
+                os.sched_setaffinity(0, {cpu})
+            res = _check_batch(repo, info[repo], [j[2] for j in b], f"{work}/b{k}_{repo.replace('/', '__')}", log)
+        finally:
+            cpus.put(cpu)
+        with lock:
+            done[0] += 1
+            if progress:
+                with open(progress, "a", encoding="utf-8") as f:
+                    f.writelines(json.dumps({"model": m, "id": rows[i]["id"], "fill": j[3], "pass": ok}) + "\n"
+                                 for (m, i, j), ok in zip(b, res))
         log(f"   {done[0]}/{len(batches)} batches done ({(time.time() - t0) / 60:.0f} min)")
         return res
 
@@ -177,8 +208,11 @@ def main():
     ap.add_argument("--repos", default="")
     ap.add_argument("--limit", type=int, default=0, help="smoke test: only the first N holes of each repo")
     ap.add_argument("--show", type=int, default=0, help="table: only the best N earlier models (0: all)")
+    ap.add_argument("--progress", default="", help="file of finished batches: a rerun continues from it")
     args = ap.parse_args()
     log = lambda m: print(m, flush=True)
+    if hasattr(os, "nice"):
+        os.nice(10)  # the tests yield to the notebook, so it stays responsive while they run
 
     rows = [json.loads(line) for line in open(args.data, encoding="utf-8") if line.strip()]
     saved = json.load(open(args.fills, encoding="utf-8"))
@@ -198,7 +232,8 @@ def main():
 
     setup_toolchain(args.tools, log)
     t0 = time.time()
-    passed = evaluate(rows, fills, repo_fim.load_repo_info(args.repo_info), args.work, args.workers, log=log)
+    passed = evaluate(rows, fills, repo_fim.load_repo_info(args.repo_info), args.work, args.workers,
+                      progress=args.progress, log=log)
     untested = sum(v is None for v in passed.values())
     log(f"tests took {(time.time() - t0) / 60:.0f} min")
 
