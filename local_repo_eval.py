@@ -115,11 +115,13 @@ def _checkout(info: dict, root: str) -> None:
 def _check_batch(repo: str, info: dict, fills: list[tuple[str, int, int, str]], root: str, log) -> list[bool | None]:
     """modal_repo_fim.check on this machine: install the repo, confirm its tests pass, then test each fill.
     A repo that won't install or pass its own tests gives None ("couldn't test") for its fills."""
-    # This batch's own package caches (npm, pnpm, uv), next to the checkout and deleted with it: shared caches kept
-    # growing, and on molab the disk lives in RAM, so they ate into the notebook's memory until it was killed.
-    c = f"{root}.cache"
+    # Package caches (npm, pnpm, uv) shared by all batches of this run, so a batch reuses what earlier ones
+    # downloaded and links it (pnpm, uv hardlinks) instead of downloading and unpacking everything again: on molab
+    # the sandbox died after ~8 batches of fresh installs while its memory looked fine, so the file churn is the
+    # suspect. Kept until the run ends (_stop_older_runs clears `work` at the start of the next).
+    c = os.path.join(os.path.dirname(root), "cache")
     env = (f"export npm_config_cache={c}/npm npm_config_store_dir={c}/pnpm-store XDG_DATA_HOME={c}/data "
-           f"XDG_CACHE_HOME={c}/cache UV_CACHE_DIR={c}/uv; ")
+           f"XDG_CACHE_HOME={c}/cache UV_CACHE_DIR={c}/uv UV_LINK_MODE=hardlink; ")
     cfg = {k: env + v if k in ("setup", "test") else v for k, v in repo_fim.REPOS[repo].items()}
     try:
         _checkout(info, root)
@@ -135,6 +137,16 @@ def _check_batch(repo: str, info: dict, fills: list[tuple[str, int, int, str]], 
         timeout = max(60.0, 3 * secs + 30)
         out = [repo_fim.check_fill(root, path, lo, hi, middle, cfg["test"], timeout)[0]
                for path, lo, hi, middle in fills]
+        # The original code must still pass afterwards: on molab, fills tested in the minutes before the sandbox
+        # died failed although the same fills pass elsewhere. A batch whose machine broke down mid-way is
+        # "couldn't test" (None), so a rerun tests it again, instead of recording false fails.
+        for _ in range(2):
+            ok, _, tail = repo_fim.run(cfg["test"], root, timeout)
+            if ok:
+                break
+        if not ok:
+            raise RuntimeError(f"the original code's tests fail AFTER the fills, so this machine broke down "
+                               f"mid-batch:\n{tail}")
         log(f"[{repo}] {sum(out)}/{len(out)} fills pass")
         return out
     except Exception as e:
@@ -145,7 +157,6 @@ def _check_batch(repo: str, info: dict, fills: list[tuple[str, int, int, str]], 
         if n:
             log(f"[{repo}] stopped {n} leftover process(es)")
         shutil.rmtree(root, ignore_errors=True)
-        shutil.rmtree(c, ignore_errors=True)
 
 
 def _stop_older_runs(work: str, log) -> None:
