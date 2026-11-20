@@ -200,8 +200,7 @@ MEM_GB = 0.0  # --mem-gb: the real memory allowance, when the machine can't see 
 
 def _machine() -> tuple[float, float, str]:
     """(memory used GB, memory limit GB, short status) of this container, for the progress lines: if the notebook
-    dies, the last line shows what was running out. With MEM_GB set, files in /tmp count as memory too: molab's
-    disk lives in RAM (its size reads as ~9 billion GB)."""
+    dies, the last line shows what was running out. MEM_GB, if set, is the limit (molab's sandbox shows the host's)."""
     def read(path):
         try:
             return open(path).read().strip()
@@ -231,10 +230,12 @@ def _machine() -> tuple[float, float, str]:
             elif line.startswith("Threads:"):
                 threads += int(line.split()[1])
     used_b = max(used_b, rss)
+    # /tmp is shown, not counted: on a molab GPU notebook it held 48 GB (vLLM + the model) with 32 GB of RAM and
+    # nothing died, so its files aren't in RAM; counting them made every batch wait.
     tmp = shutil.disk_usage("/tmp").used if os.path.isdir("/tmp") else 0
     if MEM_GB:
-        used_b, limit_b = used_b + tmp, MEM_GB * 1e9
-    status = (f"memory {used_b / 1e9:.1f}/{limit_b / 1e9:.0f} GB" + (" (processes + /tmp files)" if MEM_GB else "")
+        limit_b = MEM_GB * 1e9
+    status = (f"memory {used_b / 1e9:.1f}/{limit_b / 1e9:.0f} GB"
               + f" | processes {rss / 1e9:.1f} GB in {len(pids)}, {threads} threads | /tmp {tmp / 1e9:.1f} GB")
     return used_b / 1e9, limit_b / 1e9, status
 

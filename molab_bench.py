@@ -35,8 +35,8 @@ def _(mo, start, token):
     REDO_FILLS = False  # True: make new fills even if this model's are already uploaded (e.g. the model changed)
     LIMIT = 0  # smoke test: test only the first N holes of each repo (0: all 600)
     WORKERS = 4  # test batches at once: molab gives 4 CPUs
-    # This notebook's memory in GB (the specs button at the top: 4 CPU · 32 GiB, GPU or not). molab's disk lives in
-    # RAM, so the tests count their files as memory too and wait before starting a batch above 75% of this.
+    # This notebook's memory in GB (the specs button at the top: 4 CPU · 32 GiB, GPU or not): the tests wait before
+    # starting a batch above 75% of this.
     MEM_GB = 32
     DATASET = "neutronai-code/quark-data"
     BENCH = "bench/repo_holes_ctx2.jsonl"  # the 600 holes with editor-style (names) context, 4k chars
@@ -46,9 +46,16 @@ def _(mo, start, token):
 
     from huggingface_hub import HfApi, hf_hub_download
 
-    # Results are kept per model VERSION (its current Hugging Face commit), so e.g. v0.7 halfway through training
-    # and the finished v0.7 get their own fills and their own column in the table.
-    SHA = HfApi(token=tok).model_info(MODEL).sha
+    # Results are kept per model VERSION, so e.g. v0.7 halfway through training and the finished v0.7 get their own
+    # fills and their own column in the table. The version is the newest commit that changed the model's own files
+    # (top folder), not the repo's latest commit: a training run commits its last-checkpoint/ every 100 steps
+    # without changing the model, and that must neither look like a newer model nor redo its fills.
+    from huggingface_hub.hf_api import RepoFile
+    _files = [f for f in HfApi(token=tok).list_repo_tree(MODEL, expand=True)
+              if isinstance(f, RepoFile) and f.last_commit and f.path != ".gitattributes"
+              and not f.path.endswith(".md")]
+    SHA = (max(_files, key=lambda f: f.last_commit.date).last_commit.oid if _files
+           else HfApi(token=tok).model_info(MODEL).sha)
     NAME = f"{MODEL}@{SHA[:7]}"
     OUT = f"bench/fills_{NAME.split('/')[-1]}_ctx2.json"
     print("Benchmarking", NAME, flush=True)
@@ -194,7 +201,7 @@ def _(mo, start, token):
                              "--mem-gb", str(MEM_GB),
                              # finished batches, also kept on Hugging Face (a restart wipes this machine's disk):
                              # rerunning continues instead of starting over
-                             "--progress", os.path.join(work, "test_progress.jsonl"),
+                             "--progress", os.path.join(work, f"progress_{NAME.split('/')[-1]}.jsonl"),
                              "--hub-progress", f"{DATASET}:bench/progress_{NAME.split('/')[-1]}.jsonl"],
                             cwd=code, env=dict(os.environ, HF_TOKEN=tok),
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
