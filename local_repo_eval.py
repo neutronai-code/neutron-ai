@@ -84,6 +84,10 @@ def setup_toolchain(tools: str, log=print) -> None:
         # C++ builds: 2 compile jobs each, since several repos build at once (Ninja would otherwise start one per
         # core it can see, which in a container can be the whole host's)
         "CMAKE_BUILD_PARALLEL_LEVEL": "2",
+        # Node: fewer helper threads per process (V8's worker pool and libuv's I/O pool). molab's notebook died
+        # whenever several vitest batches ran at once (~90 Node processes): likely a cap on threads, since memory
+        # was a third used. These don't change what the tests check.
+        "NODE_OPTIONS": "--v8-pool-size=2", "UV_THREADPOOL_SIZE": "2",
     })
     for k in ("CFLAGS", "CXXFLAGS", "CPPFLAGS", "VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME"):
         os.environ.pop(k, None)
@@ -191,18 +195,44 @@ def _machine() -> tuple[float, float, str]:
     # The processes' own memory, added up: on molab the RAM line above stayed ~1 GB with 100 Node processes
     # running, so it misses most of it.
     pids = [p for p in os.listdir("/proc") if p.isdigit()] if os.path.isdir("/proc") else []
-    rss = 0
+    rss = threads = 0
     for p in pids:
         for line in read(f"/proc/{p}/status").splitlines():
             if line.startswith("VmRSS:"):
                 rss += int(line.split()[1]) * 1024
+            elif line.startswith("Threads:"):
+                threads += int(line.split()[1])
     used_b = max(used_b, rss)
     tmp = shutil.disk_usage("/tmp").used if os.path.isdir("/tmp") else 0
     if MEM_GB:
         used_b, limit_b = used_b + tmp, MEM_GB * 1e9
     status = (f"memory {used_b / 1e9:.1f}/{limit_b / 1e9:.0f} GB" + (" (processes + /tmp files)" if MEM_GB else "")
-              + f" | processes {rss / 1e9:.1f} GB in {len(pids)} | /tmp {tmp / 1e9:.1f} GB")
+              + f" | processes {rss / 1e9:.1f} GB in {len(pids)}, {threads} threads | /tmp {tmp / 1e9:.1f} GB")
     return used_b / 1e9, limit_b / 1e9, status
+
+
+def _limits() -> str:
+    """The machine's caps on processes / threads / open files, printed once at the start."""
+    out = []
+    for path in ("/sys/fs/cgroup/pids.max", "/sys/fs/cgroup/pids/pids.max"):
+        try:
+            out.append(f"pids.max {open(path).read().strip()}")
+            break
+        except OSError:
+            pass
+    try:
+        import resource
+
+        for name in ("RLIMIT_NPROC", "RLIMIT_NOFILE"):
+            soft, hard = resource.getrlimit(getattr(resource, name))
+            out.append(f"{name[7:].lower()} {soft if soft >= 0 else 'unlimited'}")
+    except (ImportError, AttributeError, ValueError):
+        pass
+    try:
+        out.append(f"threads-max {open('/proc/sys/kernel/threads-max').read().strip()}")
+    except OSError:
+        pass
+    return ", ".join(out) or "unknown"
 
 
 def _hub(spec: str, local: str, upload: bool) -> None:
@@ -227,7 +257,8 @@ def _hub(spec: str, local: str, upload: bool) -> None:
 
 
 def evaluate(rows: list[dict], fills: dict[str, list[str]], info: dict, work: str, workers: int = 4, chunk: int = 12,
-             progress: str = "", hub_progress: str = "", log=print) -> dict[tuple[str, int], bool | None]:
+             progress: str = "", hub_progress: str = "", node_workers: int = 2,
+             log=print) -> dict[tuple[str, int], bool | None]:
     """(model, hole index) -> passed (None: couldn't be tested). Batches of `chunk` fills from one repo run in
     parallel, each in its own fresh checkout, slowest repos first. Each finished batch is appended to `progress`
     (if given), and a rerun skips the fills already tested there, so a restarted notebook continues."""
@@ -253,6 +284,13 @@ def evaluate(rows: list[dict], fills: dict[str, list[str]], info: dict, work: st
     batches = [(repo, js[k:k + chunk]) for repo, js in jobs.items() for k in range(0, len(js), chunk)]
     slow = {"EbodShojaei/bake": 54, "MichielMe/fastscheduler": 27, "meodai/heerich": 12}  # test seconds, from mining
     batches.sort(key=lambda b: -len(b[1]) * slow.get(b[0], 8))
+    # At most `node_workers` batches of Node repos (vitest, node --test) at once: they start the most processes
+    # and threads. Interleave them with the Python / C++ batches so the other workers keep busy meanwhile.
+    lang = {r["repo"]: r["lang"] for r in rows}
+    is_node = lambda repo: lang[repo] in ("typescript", "javascript")
+    node_b, other_b = [b for b in batches if is_node(b[0])], [b for b in batches if not is_node(b[0])]
+    batches = [b for pair in zip(other_b, node_b) for b in pair] + other_b[len(node_b):] + node_b[len(other_b):]
+    node_slots = threading.Semaphore(max(1, node_workers))
     if done_before:
         log(f"{len(done_before)} fills were already tested in an earlier run (from {progress})")
     log(f"{sum(passed.values())} fills pass without a new test run (exact or tested before); testing "
@@ -270,6 +308,16 @@ def evaluate(rows: list[dict], fills: dict[str, list[str]], info: dict, work: st
 
     def run(k):
         repo, b = batches[k]
+        node = is_node(repo)
+        if node:
+            node_slots.acquire()
+        try:
+            return run_batch(k, repo, b)
+        finally:
+            if node:
+                node_slots.release()
+
+    def run_batch(k, repo, b):
         cpu = cpus.get()
         waited = 0
         while True:  # don't start another batch while memory is nearly full: wait for running ones to finish
@@ -323,6 +371,8 @@ def main():
     ap.add_argument("--progress", default="", help="file of finished batches: a rerun continues from it")
     ap.add_argument("--hub-progress", default="",
                     help="<dataset>:<path> on Hugging Face to keep --progress in too (survives a wiped disk; HF_TOKEN)")
+    ap.add_argument("--node-workers", type=int, default=2,
+                    help="at most this many batches of Node repos at once (they start the most processes)")
     ap.add_argument("--mem-gb", type=float, default=0,
                     help="memory allowance in GB, counting /tmp files too (molab: its disk lives in RAM)")
     args = ap.parse_args()
@@ -350,9 +400,11 @@ def main():
 
     setup_toolchain(args.tools, log)
     log("machine: " + _machine()[2])
+    log("limits: " + _limits())
     t0 = time.time()
     passed = evaluate(rows, fills, repo_fim.load_repo_info(args.repo_info), args.work, args.workers,
-                      progress=args.progress, hub_progress=args.hub_progress, log=log)
+                      progress=args.progress, hub_progress=args.hub_progress, node_workers=args.node_workers,
+                      log=log)
     untested = sum(v is None for v in passed.values())
     log(f"tests took {(time.time() - t0) / 60:.0f} min")
 
