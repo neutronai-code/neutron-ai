@@ -35,6 +35,9 @@ def _(mo, start, token):
     REDO_FILLS = False  # True: make new fills even if this model's are already uploaded (e.g. the model changed)
     LIMIT = 0  # smoke test: test only the first N holes of each repo (0: all 600)
     WORKERS = 4  # test batches at once: molab gives 4 CPUs
+    # This notebook's memory in GB (notebook specs button). molab's disk lives in RAM, so the tests count their files
+    # as memory too and wait before starting a batch above 75% of this. Too low only makes the tests slower.
+    MEM_GB = 8
     DATASET = "neutronai-code/quark-data"
     BENCH = "bench/repo_holes_ctx2.jsonl"  # the 600 holes with editor-style (names) context, 4k chars
     REPORT = "bench/report_ctx2.jsonl"  # every model's per-hole results, so the table shows them side by side
@@ -188,9 +191,13 @@ def _(mo, start, token):
     proc = subprocess.Popen([sys.executable, "-u", "local_repo_eval.py", "--data", os.path.join(work, BENCH),
                              "--fills", fills_path, "--report", report, "--repo-info", info,
                              "--workers", str(WORKERS), "--limit", str(LIMIT), "--show", "4",
-                             # finished batches: rerunning after a restart continues instead of starting over
-                             "--progress", os.path.join(work, "test_progress.jsonl")],
-                            cwd=code, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+                             "--mem-gb", str(MEM_GB),
+                             # finished batches, also kept on Hugging Face (a restart wipes this machine's disk):
+                             # rerunning continues instead of starting over
+                             "--progress", os.path.join(work, "test_progress.jsonl"),
+                             "--hub-progress", f"{DATASET}:bench/progress_{NAME.split('/')[-1]}.jsonl"],
+                            cwd=code, env=dict(os.environ, HF_TOKEN=tok),
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
     with open(test_log, "w") as _log:
         for line in proc.stdout:
             _log.write(line)

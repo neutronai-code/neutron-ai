@@ -62,6 +62,8 @@ def setup_toolchain(tools: str, log=print) -> None:
                            env=dict(os.environ, MAMBA_ROOT_PREFIX=f"{tools}/mamba"), capture_output=True, text=True)
         if r.returncode:
             raise RuntimeError("micromamba failed:\n" + (r.stdout + r.stderr)[-3000:])
+        shutil.rmtree(f"{tools}/mamba/pkgs", ignore_errors=True)  # the downloaded packages (~1 GB): installed now
+        os.remove(f"{mm}.tar.bz2")
     os.makedirs(shims, exist_ok=True)  # plain names for build scripts that don't read CC / CXX (conda's are prefixed)
     for short, full in (("gcc", "gcc"), ("cc", "gcc"), ("gcc-14", "gcc"), ("g++", "g++"), ("c++", "g++"),
                         ("g++-14", "g++"), ("ar", "ar"), ("ranlib", "ranlib"), ("ld", "ld"), ("nm", "nm"),
@@ -109,7 +111,12 @@ def _checkout(info: dict, root: str) -> None:
 def _check_batch(repo: str, info: dict, fills: list[tuple[str, int, int, str]], root: str, log) -> list[bool | None]:
     """modal_repo_fim.check on this machine: install the repo, confirm its tests pass, then test each fill.
     A repo that won't install or pass its own tests gives None ("couldn't test") for its fills."""
-    cfg = repo_fim.REPOS[repo]
+    # This batch's own package caches (npm, pnpm, uv), next to the checkout and deleted with it: shared caches kept
+    # growing, and on molab the disk lives in RAM, so they ate into the notebook's memory until it was killed.
+    c = f"{root}.cache"
+    env = (f"export npm_config_cache={c}/npm npm_config_store_dir={c}/pnpm-store XDG_DATA_HOME={c}/data "
+           f"XDG_CACHE_HOME={c}/cache UV_CACHE_DIR={c}/uv; ")
+    cfg = {k: env + v if k in ("setup", "test") else v for k, v in repo_fim.REPOS[repo].items()}
     try:
         _checkout(info, root)
         ok, _, tail = repo_fim.run(cfg["setup"], root, 30 * 60)
@@ -134,6 +141,7 @@ def _check_batch(repo: str, info: dict, fills: list[tuple[str, int, int, str]], 
         if n:
             log(f"[{repo}] stopped {n} leftover process(es)")
         shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(c, ignore_errors=True)
 
 
 def _kill_inside(root: str) -> int:
@@ -155,9 +163,13 @@ def _kill_inside(root: str) -> int:
     return n
 
 
+MEM_GB = 0.0  # --mem-gb: the real memory allowance, when the machine can't see it (molab shows the host's RAM)
+
+
 def _machine() -> tuple[float, float, str]:
     """(memory used GB, memory limit GB, short status) of this container, for the progress lines: if the notebook
-    dies, the last line shows what was running out."""
+    dies, the last line shows what was running out. With MEM_GB set, files in /tmp count as memory too: molab's
+    disk lives in RAM (its size reads as ~9 billion GB)."""
     def read(path):
         try:
             return open(path).read().strip()
@@ -177,18 +189,43 @@ def _machine() -> tuple[float, float, str]:
     used_b = int(used) - cache if used.isdigit() else total - avail
     limit_b = int(limit) if limit.isdigit() and int(limit) < total else total
     procs = sum(p.isdigit() for p in os.listdir("/proc")) if os.path.isdir("/proc") else 0
-    tmp = shutil.disk_usage("/tmp") if os.path.isdir("/tmp") else None
-    status = (f"RAM {used_b / 1e9:.1f}/{limit_b / 1e9:.0f} GB | {procs} processes"
-              + (f" | /tmp {tmp.used / 1e9:.1f}/{tmp.total / 1e9:.0f} GB" if tmp else ""))
+    tmp = shutil.disk_usage("/tmp").used if os.path.isdir("/tmp") else 0
+    if MEM_GB:
+        used_b, limit_b = used_b + tmp, MEM_GB * 1e9
+    status = (f"memory {used_b / 1e9:.1f}/{limit_b / 1e9:.0f} GB" + (" (RAM + /tmp files)" if MEM_GB else "")
+              + f" | /tmp {tmp / 1e9:.1f} GB | {procs} processes")
     return used_b / 1e9, limit_b / 1e9, status
 
 
+def _hub(spec: str, local: str, upload: bool) -> None:
+    """Copy the progress file to / from "<dataset>:<path>" on Hugging Face (token: HF_TOKEN), so a rerun can
+    continue even after the machine's disk was wiped. Failures are reported, never fatal."""
+    from huggingface_hub import HfApi, hf_hub_download
+
+    repo_id, path = spec.split(":", 1)
+    try:
+        if upload:
+            HfApi().upload_file(path_or_fileobj=local, path_in_repo=path, repo_id=repo_id, repo_type="dataset",
+                                commit_message="benchmark progress")
+        else:
+            got = hf_hub_download(repo_id, path, repo_type="dataset", local_dir=os.path.dirname(local) or ".",
+                                  force_download=True)
+            if os.path.abspath(got) != os.path.abspath(local):
+                shutil.copyfile(got, local)
+            print(f"progress from an earlier run: {spec}", flush=True)
+    except Exception as e:
+        if upload or "404" not in str(e) and "EntryNotFound" not in type(e).__name__:
+            print(f"(progress {'upload' if upload else 'download'} skipped: {str(e)[:200]})", flush=True)
+
+
 def evaluate(rows: list[dict], fills: dict[str, list[str]], info: dict, work: str, workers: int = 4, chunk: int = 12,
-             progress: str = "", log=print) -> dict[tuple[str, int], bool | None]:
+             progress: str = "", hub_progress: str = "", log=print) -> dict[tuple[str, int], bool | None]:
     """(model, hole index) -> passed (None: couldn't be tested). Batches of `chunk` fills from one repo run in
     parallel, each in its own fresh checkout, slowest repos first. Each finished batch is appended to `progress`
     (if given), and a rerun skips the fills already tested there, so a restarted notebook continues."""
     done_before = {}
+    if progress and hub_progress and not os.path.exists(progress):
+        _hub(hub_progress, progress, upload=False)
     if progress and os.path.exists(progress):
         for line in open(progress, encoding="utf-8"):
             x = json.loads(line)
@@ -221,16 +258,20 @@ def evaluate(rows: list[dict], fills: dict[str, list[str]], info: dict, work: st
     for k in range(workers):
         cpus.put(allowed[k % len(allowed)])
 
+    running = [0]
+
     def run(k):
         repo, b = batches[k]
         cpu = cpus.get()
         waited = 0
         while True:  # don't start another batch while memory is nearly full: wait for running ones to finish
             used, limit, status = _machine()
-            if not limit or used < 0.75 * limit or waited > 600:
-                break
-            if waited % 60 == 0:
-                log(f"   (memory is {used:.1f}/{limit:.0f} GB: waiting before starting {repo})")
+            with lock:
+                if not limit or used < 0.75 * limit or running[0] == 0:
+                    running[0] += 1
+                    break
+            if waited % 120 == 0:
+                log(f"   (memory {used:.1f}/{limit:.0f} GB: {repo} waits for a running batch to finish)")
             time.sleep(10)
             waited += 10
         try:
@@ -239,12 +280,16 @@ def evaluate(rows: list[dict], fills: dict[str, list[str]], info: dict, work: st
             res = _check_batch(repo, info[repo], [j[2] for j in b], f"{work}/b{k}_{repo.replace('/', '__')}", log)
         finally:
             cpus.put(cpu)
+            with lock:
+                running[0] -= 1
         with lock:
             done[0] += 1
             if progress:
                 with open(progress, "a", encoding="utf-8") as f:
                     f.writelines(json.dumps({"model": m, "id": rows[i]["id"], "fill": j[3], "pass": ok}) + "\n"
                                  for (m, i, j), ok in zip(b, res))
+                if hub_progress:
+                    _hub(hub_progress, progress, upload=True)
         log(f"   {done[0]}/{len(batches)} batches done ({(time.time() - t0) / 60:.0f} min) | {_machine()[2]}")
         return res
 
@@ -268,7 +313,13 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="smoke test: only the first N holes of each repo")
     ap.add_argument("--show", type=int, default=0, help="table: only the best N earlier models (0: all)")
     ap.add_argument("--progress", default="", help="file of finished batches: a rerun continues from it")
+    ap.add_argument("--hub-progress", default="",
+                    help="<dataset>:<path> on Hugging Face to keep --progress in too (survives a wiped disk; HF_TOKEN)")
+    ap.add_argument("--mem-gb", type=float, default=0,
+                    help="memory allowance in GB, counting /tmp files too (molab: its disk lives in RAM)")
     args = ap.parse_args()
+    global MEM_GB
+    MEM_GB = args.mem_gb
     log = lambda m: print(m, flush=True)
     if hasattr(os, "nice"):
         os.nice(10)  # the tests yield to the notebook, so it stays responsive while they run
@@ -293,7 +344,7 @@ def main():
     log("machine: " + _machine()[2])
     t0 = time.time()
     passed = evaluate(rows, fills, repo_fim.load_repo_info(args.repo_info), args.work, args.workers,
-                      progress=args.progress, log=log)
+                      progress=args.progress, hub_progress=args.hub_progress, log=log)
     untested = sum(v is None for v in passed.values())
     log(f"tests took {(time.time() - t0) / 60:.0f} min")
 
