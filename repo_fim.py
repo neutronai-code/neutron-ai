@@ -160,6 +160,10 @@ def run(cmd: str, cwd: str, timeout: float) -> tuple[bool, float, str]:
         os.killpg(proc.pid, signal.SIGKILL)
         out, _ = proc.communicate()
         ok, out = False, (out or "") + f"\n[timeout after {timeout:.0f}s]"
+    try:  # anything the command left running in the background (a test server, a worker): on a long-lived machine
+        os.killpg(proc.pid, signal.SIGKILL)  # these would pile up, unlike in a throwaway container
+    except (ProcessLookupError, PermissionError):
+        pass
     return ok, time.time() - t0, "\n".join((out or "").splitlines()[-15:])
 
 

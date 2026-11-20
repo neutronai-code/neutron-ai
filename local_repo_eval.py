@@ -130,7 +130,57 @@ def _check_batch(repo: str, info: dict, fills: list[tuple[str, int, int, str]], 
         log(f"!! [{repo}] {len(fills)} fills could NOT be tested: {e}")
         return [None] * len(fills)
     finally:
+        n = _kill_inside(root)
+        if n:
+            log(f"[{repo}] stopped {n} leftover process(es)")
         shutil.rmtree(root, ignore_errors=True)
+
+
+def _kill_inside(root: str) -> int:
+    """Kill processes still running inside `root` (their working directory is there): tests that started a server
+    or a worker in a new session escape repo_fim.run's process-group kill. Returns how many."""
+    import signal
+
+    n = 0
+    for pid in os.listdir("/proc") if os.path.isdir("/proc") else []:
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+            if cwd == root or cwd.startswith(root + "/"):
+                os.kill(int(pid), signal.SIGKILL)
+                n += 1
+        except OSError:
+            pass
+    return n
+
+
+def _machine() -> tuple[float, float, str]:
+    """(memory used GB, memory limit GB, short status) of this container, for the progress lines: if the notebook
+    dies, the last line shows what was running out."""
+    def read(path):
+        try:
+            return open(path).read().strip()
+        except OSError:
+            return ""
+
+    v2 = bool(read("/sys/fs/cgroup/memory.current"))
+    cg = "/sys/fs/cgroup/" if v2 else "/sys/fs/cgroup/memory/memory."
+    used = read(cg + ("memory.current" if v2 else "usage_in_bytes"))
+    limit = read(cg + ("memory.max" if v2 else "limit_in_bytes"))
+    stat = dict(line.split() for line in read(cg + ("memory.stat" if v2 else "stat")).splitlines()
+                if len(line.split()) == 2)
+    cache = int(stat.get("inactive_file" if v2 else "total_inactive_file", 0))  # file cache the kernel can drop
+    info = dict(line.split(":", 1) for line in read("/proc/meminfo").splitlines() if ":" in line)
+    total = int(info.get("MemTotal", "0 kB").split()[0]) * 1024
+    avail = int(info.get("MemAvailable", "0 kB").split()[0]) * 1024
+    used_b = int(used) - cache if used.isdigit() else total - avail
+    limit_b = int(limit) if limit.isdigit() and int(limit) < total else total
+    procs = sum(p.isdigit() for p in os.listdir("/proc")) if os.path.isdir("/proc") else 0
+    tmp = shutil.disk_usage("/tmp") if os.path.isdir("/tmp") else None
+    status = (f"RAM {used_b / 1e9:.1f}/{limit_b / 1e9:.0f} GB | {procs} processes"
+              + (f" | /tmp {tmp.used / 1e9:.1f}/{tmp.total / 1e9:.0f} GB" if tmp else ""))
+    return used_b / 1e9, limit_b / 1e9, status
 
 
 def evaluate(rows: list[dict], fills: dict[str, list[str]], info: dict, work: str, workers: int = 4, chunk: int = 12,
@@ -174,6 +224,15 @@ def evaluate(rows: list[dict], fills: dict[str, list[str]], info: dict, work: st
     def run(k):
         repo, b = batches[k]
         cpu = cpus.get()
+        waited = 0
+        while True:  # don't start another batch while memory is nearly full: wait for running ones to finish
+            used, limit, status = _machine()
+            if not limit or used < 0.75 * limit or waited > 600:
+                break
+            if waited % 60 == 0:
+                log(f"   (memory is {used:.1f}/{limit:.0f} GB: waiting before starting {repo})")
+            time.sleep(10)
+            waited += 10
         try:
             if cpu is not None:
                 os.sched_setaffinity(0, {cpu})
@@ -186,7 +245,7 @@ def evaluate(rows: list[dict], fills: dict[str, list[str]], info: dict, work: st
                 with open(progress, "a", encoding="utf-8") as f:
                     f.writelines(json.dumps({"model": m, "id": rows[i]["id"], "fill": j[3], "pass": ok}) + "\n"
                                  for (m, i, j), ok in zip(b, res))
-        log(f"   {done[0]}/{len(batches)} batches done ({(time.time() - t0) / 60:.0f} min)")
+        log(f"   {done[0]}/{len(batches)} batches done ({(time.time() - t0) / 60:.0f} min) | {_machine()[2]}")
         return res
 
     with ThreadPoolExecutor(workers) as pool:
@@ -231,6 +290,7 @@ def main():
         f"{len({r['repo'] for r in rows})} repos")
 
     setup_toolchain(args.tools, log)
+    log("machine: " + _machine()[2])
     t0 = time.time()
     passed = evaluate(rows, fills, repo_fim.load_repo_info(args.repo_info), args.work, args.workers,
                       progress=args.progress, log=log)
