@@ -176,6 +176,78 @@ def _stop_older_runs(work: str, log) -> None:
     shutil.rmtree(work, ignore_errors=True)
 
 
+PROC_GB = 6.0  # one test process above this is a runaway fill (an endless loop that keeps allocating)
+
+
+def _guard(work: str, stop: threading.Event, log, hub_spec: str = "") -> None:
+    """Runs beside the tests. Every 0.5 s: a test process above PROC_GB, or all tests together above 80% of MEM_GB,
+    gets its process group killed, so that fill fails like it would in its own container on Modal, instead of
+    molab reclaiming the whole notebook ("stopped responding"). Every 60 s: memory, /tmp and the biggest
+    processes go to a heartbeat file, uploaded next to the progress (`hub_spec`), so after a crash it shows what
+    was running just before."""
+    import signal
+
+    page = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+    work = os.path.realpath(work)
+    beat, last_beat, uploading = [], 0.0, threading.Lock()
+    while not stop.wait(0.5):
+        procs = []
+        for pid in os.listdir("/proc") if os.path.isdir("/proc") else []:
+            if not pid.isdigit():
+                continue
+            try:
+                rss = int(open(f"/proc/{pid}/statm").read().split()[1]) * page
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+                procs.append((rss, int(pid), cwd))
+            except (OSError, ValueError, IndexError):
+                pass
+        tests = [p for p in procs if p[2] == work or p[2].startswith(work + "/")]
+        total = sum(p[0] for p in procs)
+        if tests:
+            rss, pid, cwd = max(tests)
+            if rss > PROC_GB * 1e9 or (MEM_GB and total > 0.8 * MEM_GB * 1e9):
+                try:
+                    cmd = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode("utf-8", "replace")
+                    pg = os.getpgid(pid)
+                    if pg != os.getpgid(0):
+                        os.killpg(pg, signal.SIGKILL)
+                    else:
+                        os.kill(pid, signal.SIGKILL)
+                    log(f"!! memory guard: killed a test using {rss / 1e9:.1f} GB (all processes "
+                        f"{total / 1e9:.1f} GB) in {cwd[len(work) + 1:]}: {cmd[:150]}")
+                except OSError:
+                    pass
+        if hub_spec and time.time() - last_beat > 60:
+            last_beat = time.time()
+            top = sorted(procs, reverse=True)[:6]
+            names = []
+            for rss, pid, cwd in top:
+                try:
+                    c = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode("utf-8", "replace")
+                except OSError:
+                    c = "?"
+                names.append(f"    {rss / 1e9:5.2f} GB  {cwd[len(work) + 1:] if cwd.startswith(work) else cwd}: "
+                             f"{c[:120]}")
+            beat.append(time.strftime("%H:%M:%S ") + _machine()[2] + "\n" + "\n".join(names))
+            del beat[:-30]
+            if uploading.acquire(blocking=False):
+                text = "\n".join(beat) + "\n"
+
+                def up():
+                    try:
+                        from huggingface_hub import HfApi
+
+                        repo_id, path = hub_spec.split(":", 1)
+                        HfApi().upload_file(path_or_fileobj=text.encode("utf-8"), path_in_repo=path,
+                                            repo_id=repo_id, repo_type="dataset", commit_message="benchmark heartbeat")
+                    except Exception:
+                        pass
+                    finally:
+                        uploading.release()
+
+                threading.Thread(target=up, daemon=True).start()
+
+
 def _kill_inside(root: str) -> int:
     """Kill processes still running inside `root` (their working directory is there): tests that started a server
     or a worker in a new session escape repo_fim.run's process-group kill. Returns how many."""
@@ -378,10 +450,16 @@ def evaluate(rows: list[dict], fills: dict[str, list[str]], info: dict, work: st
         log(f"   {done[0]}/{len(batches)} batches done ({(time.time() - t0) / 60:.0f} min) | {_machine()[2]}")
         return res
 
-    with ThreadPoolExecutor(workers) as pool:
-        for (repo, b), res in zip(batches, pool.map(run, range(len(batches)))):
-            for (model, i, _), ok in zip(b, res):
-                passed[model, i] = ok
+    stop = threading.Event()
+    beat = (hub_progress.replace("/progress_", "/heartbeat_").rsplit(".", 1)[0] + ".txt") if hub_progress else ""
+    threading.Thread(target=_guard, args=(work, stop, log, beat), daemon=True).start()
+    try:
+        with ThreadPoolExecutor(workers) as pool:
+            for (repo, b), res in zip(batches, pool.map(run, range(len(batches)))):
+                for (model, i, _), ok in zip(b, res):
+                    passed[model, i] = ok
+    finally:
+        stop.set()
     return passed
 
 
