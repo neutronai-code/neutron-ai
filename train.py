@@ -221,6 +221,23 @@ def _make_wallclock_guard(max_minutes: float):
     return BudgetGuardCallback()
 
 
+def _make_memory_report():
+    """Peak GPU memory after the first steps (the longest batch comes first with group_by_length, so a run that gets
+    past them won't run out of memory later) and every 500 steps."""
+    import torch
+    from transformers import TrainerCallback
+
+    class MemoryReport(TrainerCallback):
+        def on_step_end(self, args, state, control, **kwargs):
+            if torch.cuda.is_available() and (state.global_step <= 2 or state.global_step % 500 == 0):
+                total = torch.cuda.get_device_properties(0).total_memory / 1e9
+                print(f"[NeutronAI] step {state.global_step}: peak GPU memory "
+                      f"{torch.cuda.max_memory_allocated() / 1e9:.1f} of {total:.0f} GB", flush=True)
+            return control
+
+    return MemoryReport()
+
+
 def _make_hub_checkpoint_callback(repo_id: str):
     """After every checkpoint save, upload it to `<repo>/last-checkpoint` in the background, so a crashed or
     timed-out VM loses at most one save interval. `--resume` picks it back up on a fresh VM."""
@@ -230,12 +247,15 @@ def _make_hub_checkpoint_callback(repo_id: str):
     api = HfApi()
 
     class HubCheckpointCallback(TrainerCallback):
+        pending = []  # the uploads still running: main() waits for them before it exits
+
         def on_save(self, args, state, control, **kwargs):
             ckpt = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
             if os.path.isdir(ckpt):
                 print(f"[NeutronAI] uploading checkpoint-{state.global_step} -> {repo_id}/last-checkpoint", flush=True)
-                api.upload_folder(repo_id=repo_id, folder_path=ckpt, path_in_repo="last-checkpoint",
-                                  commit_message=f"checkpoint step {state.global_step}", run_as_future=True)
+                self.pending.append(api.upload_folder(repo_id=repo_id, folder_path=ckpt, path_in_repo="last-checkpoint",
+                                                      commit_message=f"checkpoint step {state.global_step}",
+                                                      run_as_future=True))
             return control
 
     return HubCheckpointCallback()
@@ -292,24 +312,69 @@ def hf_model_type(model_name: str) -> str:
 PLAIN_HF_TYPES = {"mellum"}  # architectures trained with plain transformers + PEFT instead of Unsloth
 
 
-def load_plain_lora(model_name: str, rank: int = 32):
-    """bf16 model + LoRA with plain transformers + PEFT, for architectures Unsloth doesn't cover. Mixture-of-experts
-    models whose experts are fused 3-D tensors (JetBrains Mellum2: mlp.experts.gate_up_proj / down_proj) get LoRA on
-    those tensors through PEFT's `target_parameters`, plus the usual attention projections. The experts run on
-    transformers' grouped-matmul kernel when this torch/GPU has it."""
+def _load_plain_bf16(model_name: str, weights: str | None = None):
+    """bf16 model with plain transformers, gradient checkpointing on: model_name's tokenizer, and its weights or those
+    in the folder `weights` (a training checkpoint). The experts of a mixture-of-experts model run on transformers'
+    grouped-matmul kernel when this torch/GPU has it."""
     import torch
-    from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    src = weights or model_name
     kw = dict(dtype=torch.bfloat16, attn_implementation="sdpa", device_map="cuda")
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_name, experts_implementation="grouped_mm", **kw)
+        model = AutoModelForCausalLM.from_pretrained(src, experts_implementation="grouped_mm", **kw)
     except (TypeError, ValueError) as e:  # no MoE kernel option for this model / version: the default is fine
         print(f"[NeutronAI] experts_implementation=grouped_mm not available ({e}); using the default", flush=True)
-        model = AutoModelForCausalLM.from_pretrained(model_name, **kw)
+        model = AutoModelForCausalLM.from_pretrained(src, **kw)
     model.config.use_cache = False
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    return model, tokenizer
+
+
+def load_plain_full(model_name: str, resume_from: str | None = None):
+    """bf16 model with every weight trainable, for --full-finetune on architectures in PLAIN_HF_TYPES. A
+    mixture-of-experts model's router (Mellum2: mlp.gate) stays frozen, as in the LoRA runs, so which experts each
+    token goes to doesn't drift (the training loss has no load-balancing term).
+
+    Resuming loads the checkpoint's weights here, through from_pretrained. The Trainer's own resume reloads them with
+    a plain load_state_dict, which doesn't undo transformers' checkpoint conversion: Mellum2's experts are saved one
+    tensor per expert but live fused in memory, so they'd silently stay at their starting values. (The Trainer's
+    reload then only sets the other weights again, to the same values.)"""
+    model, tokenizer = _load_plain_bf16(model_name, weights=resume_from)
+    if resume_from:
+        print(f"[NeutronAI] weights loaded from {resume_from}", flush=True)
+    frozen = [n for n, prm in model.named_parameters() if ".mlp.gate." in n or n.endswith(".router.weight")]
+    for n, prm in model.named_parameters():
+        if n in frozen:
+            prm.requires_grad_(False)
+    trainable = sum(prm.numel() for prm in model.parameters() if prm.requires_grad)
+    print(f"[NeutronAI] plain transformers full fine-tune: {trainable / 1e9:.2f}B trainable weights; "
+          f"{len(frozen)} router weights frozen", flush=True)
+    return model, tokenizer
+
+
+def make_full_ft_optimizer(model, lr: float, weight_decay: float = 0.01):
+    """8-bit AdamW with bf16 stochastic rounding (torchao). The weights stay in bf16 (no fp32 copy: it wouldn't fit),
+    and in plain bf16 an update smaller than about 1/256 of a weight rounds away to nothing; at full fine-tune
+    learning rates most updates are that small. Stochastic rounding keeps them on average. 8-bit moments: ~2 bytes
+    per weight. Weight decay on matrices only."""
+    from torchao.optim import AdamW8bit
+
+    named = [(n, prm) for n, prm in model.named_parameters() if prm.requires_grad]
+    groups = [{"params": [prm for _, prm in named if prm.dim() >= 2], "weight_decay": weight_decay},
+              {"params": [prm for _, prm in named if prm.dim() < 2], "weight_decay": 0.0}]
+    print(f"[NeutronAI] optimizer: torchao AdamW8bit, bf16 stochastic rounding, lr {lr}", flush=True)
+    return AdamW8bit(groups, lr=lr, bf16_stochastic_round=True)
+
+
+def load_plain_lora(model_name: str, rank: int = 32):
+    """bf16 model + LoRA with plain transformers + PEFT, for architectures Unsloth doesn't cover. Mixture-of-experts
+    models whose experts are fused 3-D tensors (JetBrains Mellum2: mlp.experts.gate_up_proj / down_proj) get LoRA on
+    those tensors through PEFT's `target_parameters`, plus the usual attention projections."""
+    from peft import LoraConfig, get_peft_model
+
+    model, tokenizer = _load_plain_bf16(model_name)
     model.enable_input_require_grads()
     experts = sorted({".".join(n.split(".")[-3:]) for n, prm in model.named_parameters() if prm.dim() == 3})
     names = {n.rsplit(".", 1)[-1] for n, _ in model.named_modules()}
@@ -365,10 +430,12 @@ def main():
     # ponytail: single-GPU Unsloth handles 1.5B-32B; upgrade to multi-node verl/OpenRLHF when funded past 1x H100.
     import torch
     plain = args.plain_hf or hf_model_type(args.model) in PLAIN_HF_TYPES
+    resume_from = _find_resume_checkpoint(args.out, args.push_hf) if args.resume else None
     if plain:
-        if args.mode != "fim-sft" or args.full_finetune:
-            sys.exit("[NeutronAI] the plain transformers path is wired up for fim-sft LoRA only.")
-        model, tokenizer = load_plain_lora(args.model)
+        if args.mode != "fim-sft":
+            sys.exit("[NeutronAI] the plain transformers path is wired up for fim-sft only.")
+        model, tokenizer = (load_plain_full(args.model, resume_from) if args.full_finetune
+                            else load_plain_lora(args.model))
         is_bfloat16_supported = torch.cuda.is_bf16_supported
         vision = False
     else:
@@ -433,9 +500,11 @@ def main():
     print(f"[NeutronAI] thinking={'on' if thinking_on else 'off'} (max completion {args.max_seq_len - 1024} tokens)", flush=True)
 
     callbacks = [_make_wallclock_guard(args.max_minutes)] if args.max_minutes > 0 else []
+    callbacks.append(_make_memory_report())
     if args.push_hf:
         callbacks.append(_make_hub_checkpoint_callback(args.push_hf))
-    # Full fine-tune checkpoints hold every weight + optimizer state (~10GB), so upload them less often.
+    # Full fine-tune checkpoints hold every weight + optimizer state (~10 GB for 1.5B, ~50 GB for Quark-12B), so
+    # upload them less often.
     save_steps = args.save_steps or (min(500, max(50, args.steps // 10)) if args.full_finetune
                                      else min(50, max(10, args.steps // 4)))
 
@@ -443,17 +512,20 @@ def main():
         from transformers import Trainer, TrainingArguments
 
         pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        lr = args.lr or (2e-5 if args.full_finetune else 1e-4)  # every weight moves: smaller steps
         trainer = Trainer(
             model=model,
             train_dataset=load_fim_sft_dataset(args.data, tokenizer, args.max_seq_len),
             data_collator=_fim_sft_collator(pad_id),
             callbacks=callbacks,
+            # plain full fine-tune: our own optimizer (bf16 stochastic rounding); the Trainer still makes the schedule
+            optimizers=(make_full_ft_optimizer(model, lr) if plain and args.full_finetune else None, None),
             args=TrainingArguments(
                 output_dir=args.out,
                 per_device_train_batch_size=args.batch_size,
                 gradient_accumulation_steps=args.grad_accum,
-                learning_rate=args.lr or (2e-5 if args.full_finetune else 1e-4),  # every weight moves: smaller steps
-                optim="adamw_8bit" if args.full_finetune else "adamw_torch",
+                learning_rate=lr,
+                optim="adamw_8bit" if args.full_finetune and not plain else "adamw_torch",  # unused if ours is given
                 weight_decay=0.01 if args.full_finetune else 0.0,
                 train_sampling_strategy="group_by_length",  # similar-length rows per batch: far less padding
                 lr_scheduler_type="cosine",
@@ -461,7 +533,8 @@ def main():
                 max_steps=args.steps,
                 logging_steps=5,
                 save_steps=save_steps,
-                save_total_limit=2,
+                # a full fine-tune checkpoint is ~50 GB (weights + optimizer state): keep only the newest
+                save_total_limit=1 if args.full_finetune else 2,
                 bf16=is_bfloat16_supported(),
                 fp16=not is_bfloat16_supported(),
                 remove_unused_columns=False,
@@ -634,12 +707,37 @@ def main():
                 train_dataset=load_rl_dataset(args.data, render, tokenizer, args.max_prompt_tokens),
             )
 
-    resume_from = _find_resume_checkpoint(args.out, args.push_hf) if args.resume else None
     trainer.train(resume_from_checkpoint=resume_from)
-    model.save_pretrained(args.out)
-    tokenizer.save_pretrained(args.out)
+    if torch.cuda.is_available():
+        print(f"[NeutronAI] peak GPU memory {torch.cuda.max_memory_allocated() / 1e9:.1f} GB", flush=True)
+    for cb in callbacks:  # a checkpoint upload still running must finish before this process exits
+        for fut in getattr(cb, "pending", []):
+            if not fut.done():
+                print("[NeutronAI] waiting for the checkpoint upload to finish...", flush=True)
+            fut.result()
+    if trainer.state.global_step < args.steps:  # stopped by --max-minutes: the run isn't finished
+        print(f"[NeutronAI] stopped at step {trainer.state.global_step} of {args.steps}; the checkpoint is saved"
+              + (f" on {args.push_hf}/last-checkpoint" if args.push_hf else "")
+              + ". Run again with --resume to continue.", flush=True)
+        return
+    if not (plain and args.full_finetune):  # a plain full fine-tune is uploaded straight from memory
+        model.save_pretrained(args.out)
+        tokenizer.save_pretrained(args.out)
 
-    if args.push_hf and plain:
+    if args.push_hf and plain and args.full_finetune:
+        model.config.use_cache = True  # off only for training
+        model.push_to_hub(args.push_hf, commit_message="Full fine-tune result")
+        tokenizer.push_to_hub(args.push_hf)
+        print(f"[NeutronAI] full fine-tune uploaded -> {args.push_hf}", flush=True)
+        # The ~50 GB training checkpoint isn't part of the model: drop it so downloads (vLLM, llama.cpp) skip it
+        from huggingface_hub import HfApi
+
+        try:
+            HfApi().delete_folder("last-checkpoint", repo_id=args.push_hf,
+                                  commit_message="remove the training checkpoint")
+        except Exception as e:
+            print(f"[NeutronAI] (no training checkpoint to remove: {e})", flush=True)
+    elif args.push_hf and plain:
         try:  # fold the LoRA into the weights and upload a normal model (vLLM / llama.cpp can load it directly)
             merged = model.merge_and_unload()
             merged.push_to_hub(args.push_hf, commit_message="LoRA fine-tune, merged")
