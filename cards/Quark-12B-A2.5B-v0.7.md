@@ -55,6 +55,8 @@ prompt includes about 4k characters of repository context. Every model gets the 
   holes.
 - Against DeepSeek-Coder-V2-Lite, a mixture-of-experts model of about the same active size (16B total, 2.4B active),
   v0.7 is 12.8 points ahead.
+- **The GGUF keeps the score.** The Q4_K_M [GGUF](https://huggingface.co/neutronai-code/Quark-12B-A2.5B-v0.7-GGUF)
+  (8.1 GB) passes 60.8% on the same benchmark; against these bf16 weights it wins 28 holes and loses 22, within noise.
 - Against its own base model, v0.7 wins 65 holes and loses 33. Against Qwen2.5-Coder-7B it wins 81 and loses 50.
 - Codestral-22B-v0.1 is not in the table. With raw FIM prompts its completions usually ran past the end of the hole
   (median 1,372 characters, against 83 for Quark), so its score (25.3%) says more about our setup than the model.

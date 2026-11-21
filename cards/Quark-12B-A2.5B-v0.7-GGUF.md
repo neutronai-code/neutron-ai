@@ -19,13 +19,18 @@ tags:
 
 GGUF files of [neutronai-code/Quark-12B-A2.5B-v0.7](https://huggingface.co/neutronai-code/Quark-12B-A2.5B-v0.7),
 NeutronAI's tab-completion model. It's a mixture-of-experts model with 12B parameters in total, of which only 2.5B are
-active per token, so it runs fast on a laptop. It scores **59.8%** on our test-scored FIM benchmark, against 54.7% for
-Qwen2.5-Coder-7B. See the [main model card](https://huggingface.co/neutronai-code/Quark-12B-A2.5B-v0.7) for the full results.
+active per token, so it runs fast on a laptop. See the
+[main model card](https://huggingface.co/neutronai-code/Quark-12B-A2.5B-v0.7) for the full results.
+
+**Quantizing costs nothing measurable.** On our FIM benchmark, where each completion is scored by the repository's own
+tests (600 holes from 10 repositories), the Q4_K_M file passes **60.8%**. The full bf16 model passes 59.8%: head to
+head, Q4_K_M wins 28 holes and loses 22, which is within noise. Both are level with Qwen2.5-Coder-14B (60.5%), a dense
+model with about six times the compute per token.
 
 | File | Size | Notes |
 |---|---:|---|
-| `Quark-12B-A2.5B-v0.7-Q4_K_M.gguf` | ~8 GB | recommended: runs in 16 GB of RAM |
-| `Quark-12B-A2.5B-v0.7-Q8_0.gguf` | ~13 GB | near-lossless |
+| `Quark-12B-A2.5B-v0.7-Q4_K_M.gguf` | 8.1 GB | recommended: runs in 16 GB of RAM; benchmarked above |
+| `Quark-12B-A2.5B-v0.7-Q8_0.gguf` | 12.9 GB | near-lossless |
 
 Converted with llama.cpp release b12606 (which supports Mellum2's `mellum` architecture) from the bf16 weights.
 
