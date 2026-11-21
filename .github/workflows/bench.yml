@@ -1,5 +1,5 @@
 # Quark's real-repo benchmark tests (ci_bench.py): one job per benchmark repo, all at once, then a report job.
-# Make the model's fills on molab's GPU first (molab_bench.py), then: Actions tab > "Quark benchmark tests" >
+# Make the models' fills on molab's GPU first (molab_fills.py), then: Actions tab > "Quark benchmark tests" >
 # Run workflow. Needs the repository secret HF_TOKEN (write access to the quark-data dataset).
 # The logs are public: they show pass counts and score tables, not the fills or the token.
 name: Quark benchmark tests
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       model:
-        description: "Model on Hugging Face (its fills must already be uploaded by molab_bench.py)"
+        description: "Model(s) on Hugging Face, comma-separated (fills must already be uploaded by molab_fills.py)"
         required: true
         default: "neutronai-code/Quark-12B-A2.5B-v0.7"
       ctx:

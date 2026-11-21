@@ -290,26 +290,49 @@ FIM_STOPS = ["<|endoftext|>", "<|fim_pad|>", "<|file_sep|>", "<|fim_prefix|>"]
 
 MELLUM_STOPS = ["<|endoftext|>", "<filename>", "<fim_prefix>", "<fim_suffix>"]
 GRANITE_STOPS = ["<|end_of_text|>", "<|filename|>", "<|fim_prefix|>", "<|fim_pad|>"]
+STARCODER2_STOPS = ["<|endoftext|>", "<file_sep>", "<fim_prefix>", "<fim_suffix>"]
+DEEPSEEK_STOPS = ["<｜end▁of▁sentence｜>", "<｜fim▁begin｜>", "<｜fim▁hole｜>", "<｜fim▁end｜>"]
+CODESTRAL_STOPS = ["</s>", "[PREFIX]", "[SUFFIX]", "[MIDDLE]"]
+STOPS = {"starcoder": MELLUM_STOPS, "granite": GRANITE_STOPS, "starcoder2": STARCODER2_STOPS,
+         "deepseek": DEEPSEEK_STOPS, "codestral": CODESTRAL_STOPS}
 
 _FIM_STYLE: dict[str, str] = {}
+
+# A FIM token only one family has (quoted, as it appears in tokenizer files), checked in this order. StarCoder2 and
+# Mellum share `<fim_prefix>`, so StarCoder2's `<file_sep>` goes first (Mellum has `<filename>` instead); Qwen's
+# `<|file_sep|>` doesn't match `"<file_sep>"`.
+_STYLE_MARKS = [('"<file_sep>"', "starcoder2"), ('"<fim_prefix>"', "starcoder"), ('"<|filename|>"', "granite"),
+                ('"<｜fim▁begin｜>"', "deepseek"), ('"[SUFFIX]"', "codestral")]
+
+
+def style_from_tokenizer(text: str) -> str | None:
+    """The FIM format a tokenizer file's text points to, or None if it shows none of the non-Qwen markers."""
+    return next((style for mark, style in _STYLE_MARKS if mark in text), None)
 
 
 def fim_style(model: str) -> str:
     """Which FIM prompt format a model uses, from its tokenizer on the Hub (so the name doesn't matter and a fine-tune
-    inherits its base's format): "starcoder" (JetBrains Mellum: `<fim_prefix>`, `<filename>`, suffix first), "granite"
-    (IBM Granite: Qwen's FIM tokens but `<|filename|>` for repo files), or "qwen". Cached per model."""
+    inherits its base's format):
+      "starcoder"  JetBrains Mellum: `<fim_prefix>`, `<filename>` for repo files, suffix first
+      "starcoder2" BigCode StarCoder2: `<fim_prefix>`, `<file_sep>` for repo files, prefix first
+      "granite"    IBM Granite: Qwen's FIM tokens but `<|filename|>` for repo files
+      "deepseek"   DeepSeek-Coder: `<｜fim▁begin｜>P<｜fim▁hole｜>S<｜fim▁end｜>`, repo files as comments
+      "codestral"  Mistral Codestral: `[SUFFIX]S[PREFIX]P`, repo files as comments
+      "qwen"       Qwen2.5-Coder (the benchmark's own format)
+    Cached per model."""
     if model not in _FIM_STYLE:
         try:
             from huggingface_hub import hf_hub_download
 
             # tokenizer_config.json first (small), then tokenizer.json: transformers 5 saves fine-tunes' configs without
-            # their special-token list, so a Mellum fine-tune's `<fim_prefix>` only shows in tokenizer.json.
+            # their special-token list, so a Mellum fine-tune's `<fim_prefix>` only shows in tokenizer.json (and
+            # DeepSeek's FIM tokens are only in its tokenizer.json).
             style = "qwen"
             for name in ("tokenizer_config.json", "tokenizer.json"):
                 with open(hf_hub_download(model, name), encoding="utf-8") as f:
-                    tok = f.read()
-                if '"<fim_prefix>"' in tok or '"<|filename|>"' in tok:
-                    style = "starcoder" if '"<fim_prefix>"' in tok else "granite"
+                    found = style_from_tokenizer(f.read())
+                if found:
+                    style = found
                     break
             _FIM_STYLE[model] = style
         except Exception:
@@ -336,8 +359,56 @@ def to_granite_prompt(prompt: str) -> str:
     return prompt.replace(FIM_SEP, "<|filename|>")
 
 
+def split_qwen_prompt(prompt: str) -> tuple[list[tuple[str, str]], str, str, str]:
+    """A Qwen-format FIM prompt -> (context files [(path, text)], the current file's path ("" without context),
+    prefix, suffix)."""
+    i = prompt.index(FIM_PRE)
+    ctx, rest = prompt[:i], prompt[i + len(FIM_PRE):]
+    pre, rest = rest.split(FIM_SUF, 1)
+    suf = rest[:rest.rindex(FIM_MID)]
+    blocks = [b.partition("\n") for b in ctx.split(FIM_SEP)[1:]]
+    files = [(path, text[:-1] if text.endswith("\n") else text) for path, _, text in blocks]
+    cur = files.pop()[0] if files else ""
+    return files, cur, pre, suf
+
+
+def to_starcoder2_prompt(prompt: str) -> str:
+    """StarCoder2's repo-level FIM (as in its training): `<file_sep>path\ncode` per repo file, then
+    `<file_sep><fim_prefix>current_path\nP<fim_suffix>S<fim_middle>`. Without context: `<fim_prefix>P<fim_suffix>S<fim_middle>`."""
+    files, cur, pre, suf = split_qwen_prompt(prompt)
+    if not cur:
+        return f"<fim_prefix>{pre}<fim_suffix>{suf}<fim_middle>"
+    ctx = "".join(f"<file_sep>{p}\n{t}\n" for p, t in files)
+    return f"{ctx}<file_sep><fim_prefix>{cur}\n{pre}<fim_suffix>{suf}<fim_middle>"
+
+
+def _comment_context(prompt: str) -> tuple[str, str, str]:
+    """For models without a file token (DeepSeek-Coder, Codestral): the repo files go at the top of the prefix, each
+    under a `# path` / `// path` comment line (DeepSeek-Coder's repo-level layout). -> (context + prefix, suffix,
+    context alone)."""
+    files, cur, pre, suf = split_qwen_prompt(prompt)
+    if not cur:
+        return pre, suf, ""
+    c = "#" if cur.endswith((".py", ".pyi")) else "//"
+    ctx = "".join(f"{c} {p}\n{t}\n" for p, t in files) + f"{c} {cur}\n"
+    return ctx + pre, suf, ctx
+
+
+def to_deepseek_prompt(prompt: str) -> str:
+    """DeepSeek-Coder: `<｜fim▁begin｜>P<｜fim▁hole｜>S<｜fim▁end｜>` (its tokenizer adds the BOS token)."""
+    pre, suf, _ = _comment_context(prompt)
+    return f"<｜fim▁begin｜>{pre}<｜fim▁hole｜>{suf}<｜fim▁end｜>"
+
+
+def to_codestral_prompt(prompt: str) -> str:
+    """Codestral: `[SUFFIX]S[PREFIX]P`, suffix first (its tokenizer adds `<s>`); the model then writes the middle."""
+    pre, suf, _ = _comment_context(prompt)
+    return f"[SUFFIX]{suf}[PREFIX]{pre}"
+
+
 def convert_fim_prompt(prompt: str, style: str) -> str:
-    return {"starcoder": to_mellum_prompt, "granite": to_granite_prompt}.get(style, lambda p: p)(prompt)
+    return {"starcoder": to_mellum_prompt, "granite": to_granite_prompt, "starcoder2": to_starcoder2_prompt,
+            "deepseek": to_deepseek_prompt, "codestral": to_codestral_prompt}.get(style, lambda p: p)(prompt)
 
 
 def query_fim_samples(url: str, model: str, fim_prompt: str, api_key: str = "", max_tokens: int = 256,
@@ -346,7 +417,7 @@ def query_fim_samples(url: str, model: str, fim_prompt: str, api_key: str = "", 
     (converted for models with another FIM format: see fim_style)."""
     style = fim_style(model)
     fim_prompt = convert_fim_prompt(fim_prompt, style)
-    stops = {"starcoder": MELLUM_STOPS, "granite": GRANITE_STOPS}.get(style, FIM_STOPS)
+    stops = STOPS.get(style, FIM_STOPS)
     payload = json.dumps({"model": model, "prompt": fim_prompt, "max_tokens": max_tokens, "temperature": temperature,
                           "n": n, "stop": stops, "skip_special_tokens": False}).encode("utf-8")
     headers = {"Content-Type": "application/json"}

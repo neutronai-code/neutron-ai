@@ -70,7 +70,7 @@ def _(mo, start, token):
 
     with open(hf_hub_download(MODEL, "tokenizer.json", revision=SHA, token=tok), encoding="utf-8") as _f:
         _t = _f.read()
-    fim._FIM_STYLE[MODEL] = "starcoder" if '"<fim_prefix>"' in _t else "granite" if '"<|filename|>"' in _t else "qwen"
+    fim._FIM_STYLE[MODEL] = fim.style_from_tokenizer(_t) or "qwen"
     print("FIM prompt format:", fim._FIM_STYLE[MODEL], flush=True)
 
     gpu = subprocess.run("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader", shell=True,

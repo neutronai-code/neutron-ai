@@ -100,7 +100,7 @@ def _(mo, start, token):
         # special-token list in tokenizer_config.json, so Mellum fine-tunes must not be guessed from that.
         with open(hf_hub_download(MODEL, "tokenizer.json", revision=SHA, token=tok), encoding="utf-8") as _f:
             _t = _f.read()
-        fim._FIM_STYLE[MODEL] = "starcoder" if '"<fim_prefix>"' in _t else "granite" if '"<|filename|>"' in _t else "qwen"
+        fim._FIM_STYLE[MODEL] = fim.style_from_tokenizer(_t) or "qwen"
         print("FIM prompt format:", fim._FIM_STYLE[MODEL], "(Mellum must be starcoder)", flush=True)
 
         # vLLM 0.33 on Python 3.12 in its own environment (molab's Python 3.13 can't run it). vLLM 0.33 has no
