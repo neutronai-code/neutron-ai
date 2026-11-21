@@ -48,32 +48,68 @@ def get(name: str, work: str, to: str) -> str | None:
     return os.path.join(work, to)
 
 
+def paths(ctx: str, short: str) -> dict[str, str]:
+    """Where a prompt set's files live on quark-data. "pilot" = the self-training pilot (molab_sample.py): a greedy
+    fill plus N samples per hole, from repos Quark was never trained on."""
+    if ctx == "pilot":
+        return {"holes": "pilot/holes_ctx2.jsonl", "fills": f"pilot/samples_{short}.json",
+                "progress": f"pilot/progress_{short}.jsonl", "report": f"pilot/report_{short}.jsonl"}
+    return {"holes": f"bench/repo_holes_{ctx}.jsonl", "fills": f"bench/fills_{short}_{ctx}.json",
+            "progress": f"bench/progress_{short}.jsonl", "report": f"bench/report_{ctx}.jsonl"}
+
+
+def distinct_fills(name: str, samples: list[list[str]]) -> dict[str, list[str]]:
+    """Pilot: each hole's greedy + sampled fills -> its distinct fills (same_code: identical up to trailing spaces
+    and blank edges), as "models" <name>#0, #1, ... so local_repo_eval tests each distinct fill once. Holes with
+    fewer distinct fills get "" there (an empty fill: counted as failed, never tested, ignored by the analysis)."""
+    import repo_fim
+
+    per_hole = []
+    for fills in samples:
+        uniq = []
+        for f in fills:
+            if f.strip() and not any(repo_fim.same_code(f, u) for u in uniq):
+                uniq.append(f)
+        per_hole.append(uniq)
+    k = max(len(u) for u in per_hole)
+    return {f"{name}#{j}": [u[j] if j < len(u) else "" for u in per_hole] for j in range(k)}
+
+
 def prep(a) -> str:
     name = version(HfApi(), a.model)
     short = name.split("/")[-1]
+    p = paths(a.ctx, short)
     os.makedirs(a.work, exist_ok=True)
-    holes = get(f"bench/repo_holes_{a.ctx}.jsonl", a.work, "holes.jsonl")
+    holes = get(p["holes"], a.work, "holes.jsonl")
     if not holes:
-        raise SystemExit(f"quark-data has no bench/repo_holes_{a.ctx}.jsonl")
-    saved = get(f"bench/fills_{short}_{a.ctx}.json", a.work, "fills_saved.json")
+        raise SystemExit(f"quark-data has no {p['holes']}")
+    saved = get(p["fills"], a.work, "fills_saved.json")
     if not saved:
-        raise SystemExit(f"No fills uploaded yet for {name} with the {a.ctx} prompts: make them on molab's GPU "
-                         f"first (molab_bench.py with MODEL = \"{a.model}\", CTX = \"{a.ctx}\")")
+        maker = "molab_sample.py" if a.ctx == "pilot" else f"molab_bench.py with CTX = \"{a.ctx}\""
+        raise SystemExit(f"No fills uploaded yet for {name} ({p['fills']}): make them on molab's GPU first ({maker} "
+                         f"with MODEL = \"{a.model}\")")
     rows = [json.loads(line) for line in open(holes, encoding="utf-8") if line.strip()]
-    fills = json.load(open(saved, encoding="utf-8"))["fills"][name]
+    data = json.load(open(saved, encoding="utf-8"))
+    if a.ctx == "pilot":
+        if data["key"]["ids"] != [r["id"] for r in rows]:
+            raise SystemExit(f"{p['fills']} was made for other holes than {p['holes']}")
+        models = distinct_fills(name, data["fills"])
+    else:
+        models = {name: data["fills"][name]}
     with open(os.path.join(a.work, "fills.json"), "w", encoding="utf-8") as f:
-        json.dump({"key": {"data": f"repo_holes_{a.ctx}.jsonl", "ids": [r["id"] for r in rows]},
-                   "fills": {name: fills}}, f)
+        json.dump({"key": {"data": p["holes"], "ids": [r["id"] for r in rows]}, "fills": models}, f)
     get("bench/quark_repos.jsonl", a.work, "quark_repos.jsonl")
-    if not get(f"bench/progress_{short}.jsonl", a.work, "progress.jsonl"):
+    if not get(p["progress"], a.work, "progress.jsonl"):
         open(os.path.join(a.work, "progress.jsonl"), "w").close()
-    print(f"Benchmarking {name} ({a.ctx} prompts, {len(rows)} holes)", flush=True)
+    n_fills = sum(bool(x.strip()) for fills in models.values() for x in fills)
+    print(f"Testing {name} ({a.ctx}: {len(rows)} holes, {n_fills} distinct fills)", flush=True)
     return name
 
 
 def final(a) -> None:
     name = prep(a)
     short = name.split("/")[-1]
+    p = paths(a.ctx, short)
     progress = os.path.join(a.work, "progress.jsonl")
     merged = {}  # (model, id, fill) -> row: a tested result wins over "couldn't test"
     files = [progress] + sorted(glob.glob(os.path.join(a.parts, "**", "progress.jsonl"), recursive=True))
@@ -88,10 +124,10 @@ def final(a) -> None:
         f.writelines(json.dumps(x) + "\n" for x in merged.values())
     print(f"{len(files) - 1} repo job(s) reported; {sum(x['pass'] is not None for x in merged.values())} test "
           f"results in all", flush=True)
-    hub_progress = f"bench/progress_{short}.jsonl"
+    hub_progress = p["progress"]
     HfApi().upload_file(path_or_fileobj=progress, path_in_repo=hub_progress, repo_id=DATASET, repo_type="dataset",
                         commit_message=f"benchmark progress (GitHub Actions): {name}")
-    report_name = f"bench/report_{a.ctx}.jsonl"
+    report_name = p["report"]
     report = get(report_name, a.work, "report.jsonl") or os.path.join(a.work, "report.jsonl")
     # Everything the repo jobs tested is in the progress now, so this only tests what is left, then makes the tables.
     r = subprocess.run([sys.executable, "-u", os.path.join(HERE, "local_repo_eval.py"),
@@ -110,7 +146,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("step", choices=["prep", "final"])
     ap.add_argument("--model", required=True)
-    ap.add_argument("--ctx", default="ctx2", choices=["ctx2", "ctx3"])
+    ap.add_argument("--ctx", default="ctx2", choices=["ctx2", "ctx3", "pilot"])
     ap.add_argument("--work", required=True)
     ap.add_argument("--parts", default="", help="final: folder with the repo jobs' progress.jsonl files")
     a = ap.parse_args()

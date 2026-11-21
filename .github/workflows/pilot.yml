@@ -1,0 +1,105 @@
+# Self-training pilot, step 2 of 2 (ci_bench.py --ctx pilot): tests every distinct fill that molab_sample.py made
+# (a greedy fill + N samples per hole) with the repos' own tests, one job per repo, then merges the results into
+# quark-data/pilot/report_<model>@<sha7>.jsonl. Run it after molab_sample.py has uploaded the samples.
+# Needs the repository secret HF_TOKEN. The logs are public: pass counts only, not the fills or the token.
+name: Quark pilot tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Model on Hugging Face (its pilot samples must already be uploaded by molab_sample.py)"
+        required: true
+        default: "neutronai-code/Quark-12B-A2.5B-v0.7"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quark-bench  # shares the test-results files on Hugging Face with the benchmark: one run at a time
+  cancel-in-progress: false
+
+env:
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  MODEL: ${{ inputs.model }}
+
+jobs:
+  test:
+    name: ${{ matrix.repo }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: 0, repo: "DayuanJiang/next-ai-draw-io" }
+          - { id: 1, repo: "TanStack/hotkeys" }
+          - { id: 2, repo: "docling-project/docling-mcp" }
+          - { id: 3, repo: "googleapis/js-genai" }
+          - { id: 4, repo: "gradio-app/trackio" }
+          - { id: 5, repo: "hristo2612/SQLNoir" }
+          - { id: 6, repo: "humanwhocodes/crosspost" }
+          - { id: 7, repo: "ibelick/zola" }
+          - { id: 8, repo: "jhlee0409/claude-code-history-viewer" }
+          - { id: 9, repo: "law-chain-hot/websocket-devtools" }
+          - { id: 10, repo: "microsoft/RAMPART" }
+          - { id: 11, repo: "nvpro-samples/nv_cluster_lod_builder" }
+          - { id: 12, repo: "oracle/agent-spec" }
+          - { id: 13, repo: "ozeranskii/httptap" }
+          - { id: 14, repo: "petergyang/human-review" }
+          - { id: 15, repo: "pompelmi/pompelmi" }
+          - { id: 16, repo: "rhinobase/hono-openapi" }
+          - { id: 17, repo: "saidsurucu/borsapy" }
+          - { id: 18, repo: "sentomk/patternia" }
+          - { id: 19, repo: "spaansba/ForesightJS" }
+          - { id: 20, repo: "yamlresume/yamlresume" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q huggingface_hub
+      - name: Test toolchain from cache (Node 24, GCC 14, CMake, uv)
+        uses: actions/cache@v4
+        with:
+          path: /tmp/quark_tools
+          key: quark-tools-v1
+      - name: Download the holes, samples and results so far
+        run: python ci_bench.py prep --model "$MODEL" --ctx pilot --work "$RUNNER_TEMP/w"
+      - name: Test the fills in ${{ matrix.repo }}
+        env:
+          REPO: ${{ matrix.repo }}
+        run: |
+          W="$RUNNER_TEMP/w"
+          python -u local_repo_eval.py --data "$W/holes.jsonl" --fills "$W/fills.json" --report "$W/report_part.jsonl" \
+            --repo-info "$W/quark_repos.jsonl" --repos "$REPO" --workers 4 --mem-gb 16 --progress "$W/progress.jsonl"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: progress-${{ matrix.id }}
+          path: ${{ runner.temp }}/w/progress.jsonl
+          if-no-files-found: ignore
+          retention-days: 3
+
+  report:
+    needs: test
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q huggingface_hub
+      - name: Test toolchain from cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/quark_tools
+          key: quark-tools-v1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: progress-*
+          path: ${{ runner.temp }}/parts
+      - name: Merge the results, test anything left, upload the report
+        run: python -u ci_bench.py final --model "$MODEL" --ctx pilot --work "$RUNNER_TEMP/w" --parts "$RUNNER_TEMP/parts"
