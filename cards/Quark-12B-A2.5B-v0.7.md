@@ -20,7 +20,8 @@ tags:
 **Quark** is NeutronAI's tab-completion model: you give it the code before and after the cursor, and it writes the
 missing middle. It is a fine-tune of JetBrains' [Mellum2-12B-A2.5B-Base](https://huggingface.co/JetBrains/Mellum2-12B-A2.5B-Base),
 a mixture-of-experts model with 12B parameters in total but only **2.5B active per token**, so it runs about as fast
-as a 2.5B model.
+as a 2.5B model. On our test-based benchmark it matches Qwen2.5-Coder-14B, a dense model with about six times the
+compute per token.
 
 - **Languages:** Python, TypeScript, JavaScript, C++
 - **Task:** fill-in-the-middle (FIM) with optional repository context (signatures from the repo's other files)
@@ -35,18 +36,28 @@ works**. Each completion is spliced into the real repository, and the repository
 **Benchmark:** 600 holes (short and long) from 10 recent GitHub repositories that no model here was trained on. The
 prompt includes about 4k characters of repository context. Every model gets the same prompts, with greedy decoding.
 
-| Model | Pass rate | Python | TypeScript | JavaScript | C++ | Short holes | Long holes |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| **Quark-12B-A2.5B v0.7** | **59.8%** | 67.2 | 57.2 | 46.7 | 65.8 | 70.4 | 46.4 |
-| Quark-12B-A2.5B v0.6 | 59.8% | 69.4 | 56.7 | 44.2 | 65.8 | 69.9 | 47.2 |
-| Qwen2.5-Coder-7B (base) | 54.7% | 62.2 | 56.7 | 38.3 | 56.7 | 63.0 | 44.2 |
-| Mellum2-12B-A2.5B-Base (our base) | 54.5% | 64.4 | 54.4 | 35.0 | 59.2 | 63.6 | 43.0 |
-| Quark-1.5B v0.5 | 52.2% | 65.6 | 49.4 | 38.3 | 50.0 | 62.4 | 39.2 |
-| Qwen2.5-Coder-3B (base) | 43.8% | 50.6 | 43.9 | 29.2 | 48.3 | 52.5 | 32.8 |
-| Qwen2.5-Coder-1.5B (base) | 36.3% | 47.2 | 37.8 | 24.2 | 30.0 | 43.9 | 26.8 |
-| Mellum-4b-base | 35.8% | 40.6 | 38.9 | 25.0 | 35.0 | 45.1 | 24.2 |
+| Model | Active params | Pass rate | Python | TypeScript | JavaScript | C++ | Short holes | Long holes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Qwen2.5-Coder-14B (base) | 14.7B | 60.5% | 68.9 | 58.9 | 47.5 | 63.3 | 71.6 | 46.4 |
+| **Quark-12B-A2.5B v0.7** | **2.5B** | **59.8%** | 67.2 | 57.2 | 46.7 | 65.8 | 70.4 | 46.4 |
+| Quark-12B-A2.5B v0.6 | 2.5B | 59.8% | 69.4 | 56.7 | 44.2 | 65.8 | 69.9 | 47.2 |
+| Qwen2.5-Coder-7B (base) | 7.6B | 54.7% | 62.2 | 56.7 | 38.3 | 56.7 | 63.0 | 44.2 |
+| Mellum2-12B-A2.5B-Base (our base) | 2.5B | 54.5% | 64.4 | 54.4 | 35.0 | 59.2 | 63.6 | 43.0 |
+| Quark-1.5B v0.5 | 1.5B | 52.2% | 65.6 | 49.4 | 38.3 | 50.0 | 62.4 | 39.2 |
+| DeepSeek-Coder-V2-Lite-Base | 2.4B | 47.0% | 53.3 | 50.0 | 38.3 | 41.7 | 58.2 | 32.8 |
+| Qwen2.5-Coder-3B (base) | 3.1B | 43.8% | 50.6 | 43.9 | 29.2 | 48.3 | 52.5 | 32.8 |
+| StarCoder2-3B | 3B | 42.5% | 43.9 | 47.2 | 32.5 | 43.3 | 51.9 | 30.6 |
+| Qwen2.5-Coder-1.5B (base) | 1.5B | 36.3% | 47.2 | 37.8 | 24.2 | 30.0 | 43.9 | 26.8 |
+| Mellum-4b-base | 4B | 35.8% | 40.6 | 38.9 | 25.0 | 35.0 | 45.1 | 24.2 |
 
+- **Quark matches a 14B dense model at about a sixth of the compute per token.** Qwen2.5-Coder-14B is 0.7 points
+  ahead, but head to head the two are even: v0.7 wins 56 holes and loses 60. Quark is ahead on C++ and ties on long
+  holes.
+- Against DeepSeek-Coder-V2-Lite, a mixture-of-experts model of about the same active size (16B total, 2.4B active),
+  v0.7 is 12.8 points ahead.
 - Against its own base model, v0.7 wins 65 holes and loses 33. Against Qwen2.5-Coder-7B it wins 81 and loses 50.
+- Codestral-22B-v0.1 is not in the table. With raw FIM prompts its completions usually ran past the end of the hole
+  (median 1,372 characters, against 83 for Quark), so its score (25.3%) says more about our setup than the model.
 - **Second check on unseen code:** on 1,126 more holes from 21 other repositories Quark was never trained on, v0.7
   passes **58.9%**, close to its benchmark score.
 - v0.7 trained for twice as long as v0.6 and ties it, so this is the plateau for this recipe. Doubling the repository
