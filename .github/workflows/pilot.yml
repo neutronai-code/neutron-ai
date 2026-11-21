@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: quark-bench  # shares the test-results files on Hugging Face with the benchmark: one run at a time
+  group: quark-pilot-${{ inputs.model }}  # the pilot's files are its own (pilot/...), separate from the benchmark's
   cancel-in-progress: false
 
 env:

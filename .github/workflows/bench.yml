@@ -21,7 +21,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: quark-bench  # one run at a time: they share the progress and report files on Hugging Face
+  # Runs for different models go side by side (each model has its own progress file; the report step merges into
+  # the newest shared report). Only a second run for the same model(s) waits, so they don't test the same fills twice.
+  group: quark-bench-${{ inputs.ctx }}-${{ inputs.model }}
   cancel-in-progress: false
 
 env:

@@ -155,7 +155,15 @@ def final(a) -> None:
         save_progress()
     if r.returncode:
         raise SystemExit("the tests crashed")
-    HfApi().upload_file(path_or_fileobj=report, path_in_repo=report_name, repo_id=DATASET, repo_type="dataset",
+    # Runs for other models may have updated the shared report meanwhile (they run at the same time): take the newest
+    # copy and replace only this run's models' rows in it.
+    ours = lambda x: any(x["model"] == n or x["model"].startswith(n + "#") for n in names)
+    mine = [x for x in (json.loads(line) for line in open(report, encoding="utf-8") if line.strip()) if ours(x)]
+    latest = get(report_name, a.work, "report_latest.jsonl")
+    others = [x for x in (json.loads(line) for line in open(latest, encoding="utf-8") if line.strip())
+              if not ours(x)] if latest else []
+    HfApi().upload_file(path_or_fileobj="".join(json.dumps(x) + "\n" for x in others + mine).encode("utf-8"),
+                        path_in_repo=report_name, repo_id=DATASET, repo_type="dataset",
                         commit_message=f"benchmark results (GitHub Actions): {label}")
     print(f"\nResults uploaded -> {DATASET}/{report_name}. Done!")
 
