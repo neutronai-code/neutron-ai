@@ -64,7 +64,6 @@ def _(mo, start, token):
     os.makedirs(work, exist_ok=True)
     free = shutil.disk_usage(work).free / 1e9
     print(f"Working in {work} ({free:.0f} GB free)", flush=True)
-    assert free > 55, f"Only {free:.0f} GB free in {work}: restart the notebook for a clean disk, then run again"
 
     # NeutronAI's code (fim.py: the FIM prompt format; repo_fim.py: same_code), fresh every run
     code = os.path.join(work, "neutron-ai-main")
@@ -111,7 +110,14 @@ def _(mo, start, token):
     os.makedirs(out, exist_ok=True)
     bf16 = os.path.join(out, f"{base}-BF16.gguf")
     files = {q: os.path.join(out, f"{base}-{q}.gguf") for q in QUANTS}
-    if not all(os.path.exists(f) for f in files.values()):
+    # GGUF files already on Hugging Face from an earlier run (name -> size): those aren't made or uploaded again
+    online = ({f.path: f.size for f in api.list_repo_tree(GGUF_REPO) if isinstance(f, RepoFile)}
+              if api.repo_exists(GGUF_REPO) else {})
+    done_q = [q for q, f in files.items() if os.path.basename(f) in online]
+    if done_q:
+        print(f"Already on Hugging Face: {', '.join(done_q)}", flush=True)
+    if len(done_q) < len(QUANTS) and not all(os.path.exists(f) for f in files.values()):
+        assert free > 55, f"Only {free:.0f} GB free in {work}: restart the notebook for a clean disk, then run again"
         t0 = time.time()
         hf = os.path.join(work, "hf")
         snapshot_download(MODEL, revision=SHA, local_dir=hf, token=tok, ignore_patterns=["last-checkpoint/*", "*.md"])
@@ -135,6 +141,8 @@ def _(mo, start, token):
 
     api.create_repo(GGUF_REPO, exist_ok=True)
     for q, f in files.items():
+        if q in done_q:
+            continue
         t0 = time.time()
         api.upload_file(path_or_fileobj=f, path_in_repo=os.path.basename(f), repo_id=GGUF_REPO,
                         commit_message=f"{q} GGUF of {MODEL}@{SHA[:7]} (llama.cpp {LLAMA})")
@@ -144,7 +152,10 @@ def _(mo, start, token):
     # Quick check: does the quantized model still complete code like the full one? Fills for the benchmark holes
     NAME = f"{GGUF_REPO}@{version(GGUF_REPO)[:7]}"
     q = QUANTS[0]
-    rows = [json.loads(l) for l in open(hf_hub_download(DATASET, BENCH, repo_type="dataset", token=tok,
+    if not os.path.exists(files[q]):  # a fresh notebook: get it back from Hugging Face
+        print(f"Downloading {os.path.basename(files[q])} for the check", flush=True)
+        files[q] = hf_hub_download(GGUF_REPO, os.path.basename(files[q]), token=tok, local_dir=out)
+    rows =[json.loads(l) for l in open(hf_hub_download(DATASET, BENCH, repo_type="dataset", token=tok,
                                                         local_dir=work, force_download=True), encoding="utf-8")
             if l.strip()]
     fim._FIM_STYLE[NAME] = "starcoder"
@@ -152,25 +163,34 @@ def _(mo, start, token):
     srv = subprocess.Popen([server, "-m", files[q], "-ngl", "999", "-c", str(8 * 8192), "-np", "8", "--port", "8080"],
                            env=lenv, stdout=open(log_path, "w"), stderr=subprocess.STDOUT, start_new_session=True)
     try:
+        # Wait until the model really answers: this llama-server says "healthy" while it is still loading the model
+        # (completions then fail with 503 "Loading model"), so send a tiny completion until one works
         t0 = time.time()
+        url, done = "http://localhost:8080/v1/completions", [0]
+        probe = json.dumps({"model": NAME, "prompt": "def", "max_tokens": 1}).encode()
         while True:
             if srv.poll() is not None:
                 raise RuntimeError("llama-server exited; the end of its log:\n" + open(log_path).read()[-3000:])
             try:
-                urllib.request.urlopen("http://localhost:8080/health", timeout=5)
+                urllib.request.urlopen(urllib.request.Request(url, probe, {"Content-Type": "application/json"}),
+                                       timeout=60)
                 break
             except Exception:
-                if time.time() - t0 > 600:
-                    raise RuntimeError("llama-server did not start in 10 min:\n" + open(log_path).read()[-3000:])
-                time.sleep(5)
-        url, done = "http://localhost:8080/v1/completions", [0]
+                if time.time() - t0 > 20 * 60:
+                    raise RuntimeError("llama-server did not load the model in 20 min; the end of its log:\n"
+                                       + open(log_path).read()[-3000:])
+                time.sleep(10)
+        print(f"llama-server ready after {(time.time() - t0) / 60:.1f} min", flush=True)
 
         def one(p):
-            try:
-                x = fim.extract_fim_middle(fim.query_fim_samples(url, NAME, p, max_tokens=512)[0])
-            except Exception as e:
-                print("request failed:", e, flush=True)
-                x = ""
+            x = ""
+            for attempt in range(3):
+                try:
+                    x = fim.extract_fim_middle(fim.query_fim_samples(url, NAME, p, max_tokens=512)[0])
+                    break
+                except Exception as e:
+                    print("request failed:", str(e)[:200], flush=True)
+                    time.sleep(10)
             done[0] += 1
             if done[0] % 100 == 0:
                 print(f"{done[0]}/{len(rows)} holes", flush=True)
@@ -200,6 +220,9 @@ def _(mo, start, token):
     except Exception as e:
         msg += f" (no comparison with the full model: {e})"
     print(msg, flush=True)
+    empty = sum(not f.strip() for f in fills)
+    assert empty < 0.1 * len(fills), (f"{empty}/{len(fills)} fills are empty, so something went wrong: not uploading "
+                                      f"them. The end of llama-server's log:\n" + open(log_path).read()[-3000:])
     api.upload_file(
         path_or_fileobj=json.dumps({"key": {"data": "repo_holes_ctx2.jsonl", "ids": [r["id"] for r in rows]},
                                     "fills": {NAME: fills}}).encode("utf-8"),
