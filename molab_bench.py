@@ -12,7 +12,7 @@ def _():
     #      so this notebook also runs WITHOUT a GPU (e.g. next to a training notebook) once the fills exist.
     #   2. tests (CPU): each fill is spliced into its real repo and that repo's own tests decide pass/fail
     #      (local_repo_eval.py: same scoring as Modal). The table compares MODEL with the earlier models, and the
-    #      per-hole report goes back to quark-data/bench/report_ctx2.jsonl.
+    #      per-hole report goes back to quark-data/bench/report_<CTX>.jsonl.
     # Paste the HF token, click Start. For fills, turn the GPU on first (notebook specs button at the top).
     import marimo as mo
 
@@ -39,8 +39,12 @@ def _(mo, start, token):
     # starting a batch above 75% of this.
     MEM_GB = 32
     DATASET = "neutronai-code/quark-data"
-    BENCH = "bench/repo_holes_ctx2.jsonl"  # the 600 holes with editor-style (names) context, 4k chars
-    REPORT = "bench/report_ctx2.jsonl"  # every model's per-hole results, so the table shows them side by side
+    # Which prompts: "ctx2" = the 600 holes with editor-style (names) context, 4k chars (the main benchmark);
+    # "ctx3" = the same with 8k chars. Each has its own fills and report; test results are shared (same hole + same
+    # fill = same result, whatever the prompt was).
+    CTX = "ctx2"
+    BENCH = f"bench/repo_holes_{CTX}.jsonl"
+    REPORT = f"bench/report_{CTX}.jsonl"  # every model's per-hole results, so the table shows them side by side
     work = os.path.abspath("quark_work")
     os.makedirs(work, exist_ok=True)
 
@@ -57,7 +61,7 @@ def _(mo, start, token):
     SHA = (max(_files, key=lambda f: f.last_commit.date).last_commit.oid if _files
            else HfApi(token=tok).model_info(MODEL).sha)
     NAME = f"{MODEL}@{SHA[:7]}"
-    OUT = f"bench/fills_{NAME.split('/')[-1]}_ctx2.json"
+    OUT = f"bench/fills_{NAME.split('/')[-1]}_{CTX}.json"
     print("Benchmarking", NAME, flush=True)
 
     def sh(cmd):  # run a command; show its output only if it fails (marimo hides subprocess output)
@@ -183,7 +187,7 @@ def _(mo, start, token):
             except ProcessLookupError:  # already exited
                 pass
         HfApi(token=tok).upload_file(
-            path_or_fileobj=json.dumps({"key": {"data": "repo_holes_ctx2.jsonl", "ids": [r["id"] for r in rows]},
+            path_or_fileobj=json.dumps({"key": {"data": f"repo_holes_{CTX}.jsonl", "ids": [r["id"] for r in rows]},
                                         "fills": {NAME: fills}}).encode("utf-8"),
             path_in_repo=OUT, repo_id=DATASET, repo_type="dataset", commit_message=f"benchmark fills (vLLM): {NAME}")
         print(f"Fills uploaded -> {DATASET}/{OUT}", flush=True)
@@ -191,8 +195,8 @@ def _(mo, start, token):
     # 3. Tests on this machine's CPUs (installs Node 24, GCC 14, CMake, uv the first time: a few minutes)
     fills_path = os.path.join(work, "fills_now.json")
     with open(fills_path, "w", encoding="utf-8") as _f:
-        json.dump({"key": {"data": "repo_holes_ctx2.jsonl", "ids": [r["id"] for r in rows]}, "fills": {NAME: fills}}, _f)
-    report = get(REPORT) or os.path.join(work, "bench", "report_ctx2.jsonl")
+        json.dump({"key": {"data": f"repo_holes_{CTX}.jsonl", "ids": [r["id"] for r in rows]}, "fills": {NAME: fills}}, _f)
+    report = get(REPORT) or os.path.join(work, REPORT)
     info = get("bench/quark_repos.jsonl")  # the repos' URLs and pinned commits
     test_log = os.path.join(work, "tests.log")
     proc = subprocess.Popen([sys.executable, "-u", "local_repo_eval.py", "--data", os.path.join(work, BENCH),
