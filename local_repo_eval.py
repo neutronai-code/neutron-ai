@@ -120,8 +120,10 @@ def _check_batch(repo: str, info: dict, fills: list[tuple[str, int, int, str]], 
     # the sandbox died after ~8 batches of fresh installs while its memory looked fine, so the file churn is the
     # suspect. Kept until the run ends (_stop_older_runs clears `work` at the start of the next).
     c = os.path.join(os.path.dirname(root), "cache")
-    env = (f"export npm_config_cache={c}/npm npm_config_store_dir={c}/pnpm-store XDG_DATA_HOME={c}/data "
-           f"XDG_CACHE_HOME={c}/cache UV_CACHE_DIR={c}/uv UV_LINK_MODE=hardlink; ")
+    # No PORT / HOST from the notebook: servers started by tests read them (FableCut's server.js listens on
+    # $PORT, and a broken fill can start it detached), and a notebook's PORT is the notebook's own web server.
+    env = (f"unset PORT HOST; export npm_config_cache={c}/npm npm_config_store_dir={c}/pnpm-store "
+           f"XDG_DATA_HOME={c}/data XDG_CACHE_HOME={c}/cache UV_CACHE_DIR={c}/uv UV_LINK_MODE=hardlink; ")
     cfg = {k: env + v if k in ("setup", "test") else v for k, v in repo_fim.REPOS[repo].items()}
     try:
         _checkout(info, root)
@@ -520,6 +522,8 @@ def main():
     setup_toolchain(args.tools, log)
     log("machine: " + _machine()[2])
     log("limits: " + _limits())
+    # names only (values can be secrets): which of the notebook's settings the tests inherit, e.g. PORT
+    log("env: " + " ".join(sorted(k for k in os.environ if not k.startswith(("npm_", "UV_", "XDG_", "LC_")))))
     t0 = time.time()
     passed = evaluate(rows, fills, repo_fim.load_repo_info(args.repo_info), args.work, args.workers,
                       progress=args.progress, hub_progress=args.hub_progress, node_workers=args.node_workers,
