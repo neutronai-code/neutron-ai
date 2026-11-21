@@ -1,0 +1,100 @@
+# Quark's real-repo benchmark tests (ci_bench.py): one job per benchmark repo, all at once, then a report job.
+# Make the model's fills on molab's GPU first (molab_bench.py), then: Actions tab > "Quark benchmark tests" >
+# Run workflow. Needs the repository secret HF_TOKEN (write access to the quark-data dataset).
+# The logs are public: they show pass counts and score tables, not the fills or the token.
+name: Quark benchmark tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Model on Hugging Face (its fills must already be uploaded by molab_bench.py)"
+        required: true
+        default: "neutronai-code/Quark-12B-A2.5B-v0.7"
+      ctx:
+        description: "Prompts: ctx2 = 4k context (the main benchmark), ctx3 = 8k"
+        type: choice
+        options: [ctx2, ctx3]
+        default: ctx2
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quark-bench  # one run at a time: they share the progress and report files on Hugging Face
+  cancel-in-progress: false
+
+env:
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  MODEL: ${{ inputs.model }}
+  CTX: ${{ inputs.ctx }}
+
+jobs:
+  test:
+    name: ${{ matrix.repo }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: 0, repo: "TanStack/pacer" }
+          - { id: 1, repo: "serkodev/markdown-exit" }
+          - { id: 2, repo: "ddkbs/sketchy" }
+          - { id: 3, repo: "meodai/heerich" }
+          - { id: 4, repo: "ronak-create/FableCut" }
+          - { id: 5, repo: "raulcd/datanomy" }
+          - { id: 6, repo: "EbodShojaei/bake" }
+          - { id: 7, repo: "MichielMe/fastscheduler" }
+          - { id: 8, repo: "mosaico-labs/refx" }
+          - { id: 9, repo: "EmberEmu/Hexi" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q huggingface_hub
+      - name: Test toolchain from cache (Node 24, GCC 14, CMake, uv)
+        uses: actions/cache@v4
+        with:
+          path: /tmp/quark_tools
+          key: quark-tools-v1
+      - name: Download the holes, fills and results so far
+        run: python ci_bench.py prep --model "$MODEL" --ctx "$CTX" --work "$RUNNER_TEMP/w"
+      - name: Test the fills in ${{ matrix.repo }}
+        env:
+          REPO: ${{ matrix.repo }}
+        run: |
+          W="$RUNNER_TEMP/w"
+          python -u local_repo_eval.py --data "$W/holes.jsonl" --fills "$W/fills.json" --report "$W/report_part.jsonl" \
+            --repo-info "$W/quark_repos.jsonl" --repos "$REPO" --workers 4 --mem-gb 16 --progress "$W/progress.jsonl"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: progress-${{ matrix.id }}
+          path: ${{ runner.temp }}/w/progress.jsonl
+          if-no-files-found: ignore
+          retention-days: 3
+
+  report:
+    needs: test
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q huggingface_hub
+      - name: Test toolchain from cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/quark_tools
+          key: quark-tools-v1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: progress-*
+          path: ${{ runner.temp }}/parts
+      - name: Merge the results, test anything left, make the tables, upload the report
+        run: python -u ci_bench.py final --model "$MODEL" --ctx "$CTX" --work "$RUNNER_TEMP/w" --parts "$RUNNER_TEMP/parts"
