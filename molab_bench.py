@@ -191,6 +191,15 @@ def _(mo, start, token):
                                         "fills": {NAME: fills}}).encode("utf-8"),
             path_in_repo=OUT, repo_id=DATASET, repo_type="dataset", commit_message=f"benchmark fills (vLLM): {NAME}")
         print(f"Fills uploaded -> {DATASET}/{OUT}", flush=True)
+    # Free the disk before the tests: the model download (~24 GB) and vLLM (~15 GB) sat in this sandbox's files,
+    # and with them the GPU notebook was reclaimed ("stopped responding") within minutes of the tests starting,
+    # while the CPU notebook, without them, ran for an hour. A later GPU run downloads them again (~6 min).
+    from huggingface_hub.constants import HF_HUB_CACHE
+    time.sleep(5)  # vLLM has been told to stop; let it let go of the files
+    shutil.rmtree(os.path.join(HF_HUB_CACHE, "models--" + MODEL.replace("/", "--")), ignore_errors=True)
+    shutil.rmtree(venv, ignore_errors=True)
+    print(f"Deleted the model download and vLLM: /tmp now holds {shutil.disk_usage('/tmp').used / 1e9:.0f} GB",
+          flush=True)
 
     # 3. Tests on this machine's CPUs (installs Node 24, GCC 14, CMake, uv the first time: a few minutes)
     fills_path = os.path.join(work, "fills_now.json")
