@@ -139,7 +139,8 @@ def load_sft_dataset(path: str, tokenizer):
 
 
 def load_fim_sft_dataset(path: str, tokenizer, max_len: int):
-    """FIM-SFT rows ({fim_prompt, oracle_middle}) -> token ids with the loss only on the fill + <|endoftext|>,
+    """FIM-SFT rows ({fim_prompt, oracle_middle}, or next-edit rows {prompt, target} used as they are) -> token ids
+    with the loss only on the fill + <|endoftext|>,
     the token Quark stops on at inference. Rows with "loss": "all" (quark_data_v04.py's whole-file rows) put the
     loss on every token instead. Rows longer than max_len tokens are dropped.
 
@@ -160,9 +161,10 @@ def load_fim_sft_dataset(path: str, tokenizer, max_len: int):
             if not line.strip():
                 continue
             r = json.loads(line)
-            prompt = convert_fim_prompt(r["fim_prompt"], style)
+            # Next-edit rows (nes_data.py: {"prompt", "target"}) are already in their final form; FIM rows get converted
+            prompt = r["prompt"] if "prompt" in r else convert_fim_prompt(r["fim_prompt"], style)
             p = tokenizer(prompt, add_special_tokens=False)["input_ids"]
-            c = tokenizer(r["oracle_middle"] + eos, add_special_tokens=False)["input_ids"]
+            c = tokenizer(r.get("target", r.get("oracle_middle")) + eos, add_special_tokens=False)["input_ids"]
             if len(p) + len(c) > max_len:
                 dropped += 1
                 continue

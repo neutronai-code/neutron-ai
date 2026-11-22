@@ -35,11 +35,14 @@ def _(mo, start, token):
     # Each run resumes from its own REPO/last-checkpoint, so rerunning after a shutdown continues where it was.
     # MODEL, DATA, STEPS, REPO, FULL = "JetBrains/Mellum2-12B-A2.5B-Base", "fim_v05.jsonl", 3714, "neutronai-code/Quark-12B-A2.5B-v0.6", False
     # MODEL, DATA, STEPS, REPO, FULL = "neutronai-code/Quark-12B-A2.5B-v0.6", "fim_v06.jsonl", 7456, "neutronai-code/Quark-12B-A2.5B-v0.7", False
-    MODEL, DATA, STEPS, REPO, FULL = "JetBrains/Mellum2-12B-A2.5B-Base", "fim_v05.jsonl", 3714, "neutronai-code/Quark-12B-A2.5B-v0.8-full", True
+    # MODEL, DATA, STEPS, REPO, FULL = "JetBrains/Mellum2-12B-A2.5B-Base", "fim_v05.jsonl", 3714, "neutronai-code/Quark-12B-A2.5B-v0.8-full", True
+    # Next-edit LoRA (the active run): v0.7 -> one pass over nes_mix_v08 (35.3k next-edit rows from nes_data.py plus
+    # 11.8k fim_v06 rows replayed so tab completion doesn't get worse; 47.1k rows / 16 rows per step).
+    MODEL, DATA, STEPS, REPO, FULL = "neutronai-code/Quark-12B-A2.5B-v0.7", "nes_mix_v08.jsonl", 2944, "neutronai-code/Quark-12B-A2.5B-v0.8-nes", False
     # SMOKE = True: a ~20-minute trial that uploads nothing. It trains 2 steps (the longest batch comes first, so this
     # is the memory test), saves a checkpoint, resumes it for 2 more steps and prints the peak GPU memory. Run it
     # once before a new kind of run, then set SMOKE = False for the real one.
-    SMOKE = True
+    SMOKE = False
     # Stop training after 11 h 20 min (LoRA) / 10 h 30 min (full): setup takes ~15 min (full: ~25, it downloads its
     # ~50 GB checkpoint), and the end of a session saves and uploads a checkpoint (full: ~50 GB), so this leaves time
     # before molab's 12 h session limit. A hard stop loses at most one checkpoint interval.

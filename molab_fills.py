@@ -30,10 +30,7 @@ def _(mo, start, token):
     assert tok.startswith("hf_"), "Paste your Hugging Face token first"
 
     MODELS = [
-        "Qwen/Qwen2.5-Coder-14B",
-        "deepseek-ai/DeepSeek-Coder-V2-Lite-Base",
-        "bigcode/starcoder2-3b",
-        "mistralai/Codestral-22B-v0.1",
+        "neutronai-code/Quark-12B-A2.5B-v0.8-nes",  # next-edit training: tab completion must stay at v0.7's 59.8%
     ]
     # Extra vLLM settings some models need. Codestral: read its Hugging Face files, not Mistral's own format (whose
     # tokenizer would treat "[SUFFIX]" in a raw prompt as plain text instead of the FIM token).
