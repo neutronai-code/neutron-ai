@@ -138,7 +138,7 @@ def load_sft_dataset(path: str, tokenizer):
     ])
 
 
-def load_fim_sft_dataset(path: str, tokenizer, max_len: int):
+def load_fim_sft_dataset(path: str, tokenizer, max_len: int, style: str = "auto"):
     """FIM-SFT rows ({fim_prompt, oracle_middle}, or next-edit rows {prompt, target} used as they are) -> token ids
     with the loss only on the fill + <|endoftext|>,
     the token Quark stops on at inference. Rows with "loss": "all" (quark_data_v04.py's whole-file rows) put the
@@ -151,7 +151,8 @@ def load_fim_sft_dataset(path: str, tokenizer, max_len: int):
     from fim import convert_fim_prompt
 
     vocab = tokenizer.get_vocab()
-    style = "starcoder" if "<fim_prefix>" in vocab else "granite" if "<|filename|>" in vocab else "qwen"
+    if style == "auto":  # from the tokenizer; "qwen-spm" (Qwen's tokens, suffix first) has to be asked for
+        style = "starcoder" if "<fim_prefix>" in vocab else "granite" if "<|filename|>" in vocab else "qwen"
     if style != "qwen":
         print(f"[NeutronAI] FIM-SFT: {style}-style FIM tokens: rows converted to that format", flush=True)
     eos = tokenizer.eos_token or "<|endoftext|>"  # Qwen / Mellum: <|endoftext|>; Granite: <|end_of_text|>
@@ -423,6 +424,9 @@ def main():
                     help="fim-sft LoRA with plain transformers + PEFT instead of Unsloth (automatic for "
                          "architectures in PLAIN_HF_TYPES, e.g. JetBrains Mellum2)")
     ap.add_argument("--grad-accum", type=int, default=4, help="fim-sft: micro-batches per optimizer step")
+    ap.add_argument("--fim-style", choices=["auto", "qwen-spm"], default="auto",
+                    help="fim-sft prompt format: auto = the model's own (from its tokenizer); qwen-spm = Qwen's FIM "
+                         "tokens with the suffix first (the pushed repo gets a quark_fim.json saying so)")
     args = ap.parse_args()
     if args.full_finetune and args.mode != "fim-sft":
         sys.exit("[NeutronAI] --full-finetune is only wired up for --mode fim-sft.")
@@ -517,7 +521,7 @@ def main():
         lr = args.lr or (2e-5 if args.full_finetune else 1e-4)  # every weight moves: smaller steps
         trainer = Trainer(
             model=model,
-            train_dataset=load_fim_sft_dataset(args.data, tokenizer, args.max_seq_len),
+            train_dataset=load_fim_sft_dataset(args.data, tokenizer, args.max_seq_len, args.fim_style),
             data_collator=_fim_sft_collator(pad_id),
             callbacks=callbacks,
             # plain full fine-tune: our own optimizer (bf16 stochastic rounding); the Trainer still makes the schedule
@@ -726,6 +730,15 @@ def main():
         model.save_pretrained(args.out)
         tokenizer.save_pretrained(args.out)
 
+    if args.push_hf and args.fim_style != "auto":  # tell fim.fim_style (benchmarks, editors) the prompt format
+        from huggingface_hub import HfApi
+
+        from fim import FIM_STYLE_FILE
+
+        HfApi().create_repo(args.push_hf, exist_ok=True)
+        HfApi().upload_file(path_or_fileobj=json.dumps({"style": args.fim_style}).encode(),
+                            path_in_repo=FIM_STYLE_FILE, repo_id=args.push_hf,
+                            commit_message=f"FIM prompt format: {args.fim_style}")
     if args.push_hf and plain and args.full_finetune:
         model.config.use_cache = True  # off only for training
         model.push_to_hub(args.push_hf, commit_message="Full fine-tune result")

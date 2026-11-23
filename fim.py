@@ -294,7 +294,8 @@ STARCODER2_STOPS = ["<|endoftext|>", "<file_sep>", "<fim_prefix>", "<fim_suffix>
 DEEPSEEK_STOPS = ["<｜end▁of▁sentence｜>", "<｜fim▁begin｜>", "<｜fim▁hole｜>", "<｜fim▁end｜>"]
 CODESTRAL_STOPS = ["</s>", "[PREFIX]", "[SUFFIX]", "[MIDDLE]"]
 STOPS = {"starcoder": MELLUM_STOPS, "granite": GRANITE_STOPS, "starcoder2": STARCODER2_STOPS,
-         "deepseek": DEEPSEEK_STOPS, "codestral": CODESTRAL_STOPS}
+         "deepseek": DEEPSEEK_STOPS, "codestral": CODESTRAL_STOPS, "qwen-spm": FIM_STOPS + ["<|fim_suffix|>"]}
+FIM_STYLE_FILE = "quark_fim.json"  # {"style": ...} in a model repo: a format its tokenizer can't show (qwen-spm)
 
 _FIM_STYLE: dict[str, str] = {}
 
@@ -319,11 +320,19 @@ def fim_style(model: str) -> str:
       "deepseek"   DeepSeek-Coder: `<｜fim▁begin｜>P<｜fim▁hole｜>S<｜fim▁end｜>`, repo files as comments
       "codestral"  Mistral Codestral: `[SUFFIX]S[PREFIX]P`, repo files as comments
       "qwen"       Qwen2.5-Coder (the benchmark's own format)
+      "qwen-spm"   Qwen's tokens, suffix first (Quark-1.5B from v0.6-spm): named by the repo's quark_fim.json
     Cached per model."""
     if model not in _FIM_STYLE:
         try:
             from huggingface_hub import hf_hub_download
 
+            try:  # a format the tokenizer can't tell apart (same tokens, other order): the repo says so itself
+                with open(hf_hub_download(model, FIM_STYLE_FILE), encoding="utf-8") as f:
+                    _FIM_STYLE[model] = json.load(f)["style"]
+                    return _FIM_STYLE[model]
+            except Exception as e:
+                if "404" not in str(e) and "EntryNotFound" not in type(e).__name__:
+                    raise
             # tokenizer_config.json first (small), then tokenizer.json: transformers 5 saves fine-tunes' configs without
             # their special-token list, so a Mellum fine-tune's `<fim_prefix>` only shows in tokenizer.json (and
             # DeepSeek's FIM tokens are only in its tokenizer.json).
@@ -352,6 +361,16 @@ def to_mellum_prompt(prompt: str) -> str:
     pre, rest = rest.split(FIM_SUF, 1)
     suf = rest[:rest.rindex(FIM_MID)]
     return ctx.replace(FIM_SEP, "<filename>") + "<fim_suffix>" + suf + "<fim_prefix>" + pre + "<fim_middle>"
+
+
+def to_qwen_spm_prompt(prompt: str) -> str:
+    """Qwen's FIM tokens, suffix first (`[<|file_sep|>path\n...]<|fim_suffix|>S<|fim_prefix|>P<|fim_middle|>`): the
+    order Quark-1.5B is trained in from v0.6-spm, so an editor's prompt cache keeps the suffix while the user types."""
+    i = prompt.index(FIM_PRE)
+    ctx, rest = prompt[:i], prompt[i + len(FIM_PRE):]
+    pre, rest = rest.split(FIM_SUF, 1)
+    suf = rest[:rest.rindex(FIM_MID)]
+    return ctx + FIM_SUF + suf + FIM_PRE + pre + FIM_MID
 
 
 def to_granite_prompt(prompt: str) -> str:
@@ -408,7 +427,8 @@ def to_codestral_prompt(prompt: str) -> str:
 
 def convert_fim_prompt(prompt: str, style: str) -> str:
     return {"starcoder": to_mellum_prompt, "granite": to_granite_prompt, "starcoder2": to_starcoder2_prompt,
-            "deepseek": to_deepseek_prompt, "codestral": to_codestral_prompt}.get(style, lambda p: p)(prompt)
+            "deepseek": to_deepseek_prompt, "codestral": to_codestral_prompt,
+            "qwen-spm": to_qwen_spm_prompt}.get(style, lambda p: p)(prompt)
 
 
 def query_fim_samples(url: str, model: str, fim_prompt: str, api_key: str = "", max_tokens: int = 256,

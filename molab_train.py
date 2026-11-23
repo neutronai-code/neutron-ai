@@ -36,9 +36,16 @@ def _(mo, start, token):
     # MODEL, DATA, STEPS, REPO, FULL = "JetBrains/Mellum2-12B-A2.5B-Base", "fim_v05.jsonl", 3714, "neutronai-code/Quark-12B-A2.5B-v0.6", False
     # MODEL, DATA, STEPS, REPO, FULL = "neutronai-code/Quark-12B-A2.5B-v0.6", "fim_v06.jsonl", 7456, "neutronai-code/Quark-12B-A2.5B-v0.7", False
     # MODEL, DATA, STEPS, REPO, FULL = "JetBrains/Mellum2-12B-A2.5B-Base", "fim_v05.jsonl", 3714, "neutronai-code/Quark-12B-A2.5B-v0.8-full", True
-    # Next-edit LoRA (the active run): v0.7 -> one pass over nes_mix_v08 (35.3k next-edit rows from nes_data.py plus
-    # 11.8k fim_v06 rows replayed so tab completion doesn't get worse; 47.1k rows / 16 rows per step).
-    MODEL, DATA, STEPS, REPO, FULL = "neutronai-code/Quark-12B-A2.5B-v0.7", "nes_mix_v08.jsonl", 2944, "neutronai-code/Quark-12B-A2.5B-v0.8-nes", False
+    # Next-edit LoRA: v0.7 -> one pass over nes_mix_v08 (35.3k next-edit rows from nes_data.py plus 11.8k fim_v06 rows
+    # replayed so tab completion doesn't get worse; 47.1k rows / 16 rows per step).
+    # MODEL, DATA, STEPS, REPO, FULL = "neutronai-code/Quark-12B-A2.5B-v0.7", "nes_mix_v08.jsonl", 2944, "neutronai-code/Quark-12B-A2.5B-v0.8-nes", False
+    LR, EXTRA = ("2e-5" if FULL else "1e-4"), []  # (set again below for runs that need other settings)
+    # Quark-1.5B suffix-first (the active run): v0.5 -> one full fine-tuning pass over fim_v06 with every prompt in
+    # Qwen's FIM tokens but suffix first, so the editor's prompt cache keeps the suffix while the user types (the
+    # prefix-first v0.5 had to get a 300-char suffix in the IDE: 45.0% instead of 49.7%). Plain transformers (molab
+    # has no Unsloth), v0.5's learning rate.
+    MODEL, DATA, STEPS, REPO, FULL = "neutronai-code/Quark-1.5B-v0.5", "fim_v06.jsonl", 7456, "neutronai-code/Quark-1.5B-v0.6-spm", True
+    LR, EXTRA = "1e-5", ["--plain-hf", "--fim-style", "qwen-spm"]
     # SMOKE = True: a ~20-minute trial that uploads nothing. It trains 2 steps (the longest batch comes first, so this
     # is the memory test), saves a checkpoint, resumes it for 2 more steps and prints the peak GPU memory. Run it
     # once before a new kind of run, then set SMOKE = False for the real one.
@@ -90,7 +97,7 @@ def _(mo, start, token):
         args = [sys.executable, "-u", "train.py", "--mode", "fim-sft", "--model", MODEL,
                 "--data", data, "--steps", str(steps), "--max-minutes", str(max_min), "--max-seq-len", "4096",
                 "--load-in-4bit", "no", "--out", out, "--resume", "--batch-size", "2", "--grad-accum", "8",
-                "--save-steps", str(save_steps), "--lr", "2e-5" if FULL else "1e-4",
+                "--save-steps", str(save_steps), "--lr", LR, *EXTRA,
                 *(["--full-finetune"] if FULL else []), *(["--push-hf", push] if push else [])]
         bar = re.compile(r"\d+/%d \[" % steps)
         proc = subprocess.Popen(args, cwd=code, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
