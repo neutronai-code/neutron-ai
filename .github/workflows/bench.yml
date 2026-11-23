@@ -12,9 +12,9 @@ on:
         required: true
         default: "neutronai-code/Quark-12B-A2.5B-v0.7"
       ctx:
-        description: "Prompts: ctx2 = 4k context (the main benchmark), ctx3 = 8k"
+        description: "Prompts: ctx2 = 4k context (the main benchmark), ctx3 = 8k, light = the IDE's Light profile (2k context, shorter windows), fastlight = Light with Quark-1.5B's short suffix"
         type: choice
-        options: [ctx2, ctx3]
+        options: [ctx2, ctx3, light, fastlight]
         default: ctx2
 
 permissions:

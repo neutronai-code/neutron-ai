@@ -11,6 +11,7 @@ def _():
     #   2. upload both to <model>-GGUF on Hugging Face
     #   3. quick check: Q4_K_M writes fills for the 600 benchmark holes (llama-server on the GPU), uploaded to quark-data
     #      so GitHub > Actions > "Quark benchmark tests" (model = the -GGUF repo) can score them
+    #   4. (next-edit models) Q4_K_M also rewrites the 702 next-edit benchmark rows; the score is printed here
     # Paste the HF token, turn the GPU on (notebook specs button at the top), click Start.
     import marimo as mo
 
@@ -29,7 +30,8 @@ def _(mo, start, token):
     tok = token.value.strip()
     assert tok.startswith("hf_"), "Paste your Hugging Face token first"
 
-    MODEL = "neutronai-code/Quark-12B-A2.5B-v0.7"
+    MODEL = "neutronai-code/Quark-12B-A2.5B-v0.8-nes"
+    NES = True  # also check next-edit (nes_eval.py) on the Q4 file: the full model scores 46.4% overall
     GGUF_REPO = MODEL + "-GGUF"
     QUANTS = ["Q4_K_M", "Q8_0"]  # the first one gets the benchmark check
     LLAMA = "b12606"  # llama.cpp release (supports Mellum2's "mellum" architecture)
@@ -200,6 +202,32 @@ def _(mo, start, token):
         with ThreadPoolExecutor(8) as pool:
             fills = list(pool.map(one, [r["fim_prompt"] for r in rows]))
         print(f"{q} wrote {len(fills)} fills in {(time.time() - t1) / 60:.0f} min", flush=True)
+        if NES:  # the same server, next-edit prompts (plain-text markers: nothing llama.cpp-specific)
+            import nes_eval
+
+            nes_rows = [json.loads(l) for l in open(hf_hub_download(DATASET, "bench/nes_bench.jsonl", repo_type="dataset",
+                                                                    token=tok, local_dir=work, force_download=True),
+                                                    encoding="utf-8") if l.strip()]
+
+            def nes_one(r):
+                for attempt in range(3):
+                    try:
+                        return r["id"], nes_eval.query_nes(url, NAME, r["prompt"])
+                    except Exception as e:
+                        print("request failed:", str(e)[:200], flush=True)
+                        time.sleep(10)
+                return r["id"], ""
+
+            t1 = time.time()
+            with ThreadPoolExecutor(8) as pool:
+                nes_preds = dict(pool.map(nes_one, nes_rows))
+            print(f"{q}: {len(nes_preds)} next-edit rewrites in {(time.time() - t1) / 60:.0f} min "
+                  f"(full model: overall 46.4%, exact edit 28.7%, quiet 89.7%)", flush=True)
+            nes_eval.show(nes_eval.score(nes_rows, nes_preds))
+            api.upload_file(path_or_fileobj=json.dumps({"key": {"data": "bench/nes_bench.jsonl", "n": len(nes_rows)},
+                                                        "preds": nes_preds}).encode(),
+                            path_in_repo=f"bench/nes_preds_{NAME.split('/')[-1]}.json", repo_id=DATASET,
+                            repo_type="dataset", commit_message=f"next-edit predictions: {NAME} ({q}, llama.cpp)")
     finally:
         try:
             os.killpg(srv.pid, signal.SIGTERM)

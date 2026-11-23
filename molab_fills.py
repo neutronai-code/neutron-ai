@@ -7,10 +7,10 @@ app = marimo.App(width="medium")
 @app.cell
 def _():
     # Benchmark fills on molab's GPU for one or more models, one after another: vLLM 0.33 writes each model's greedy
-    # fill for the 600 benchmark holes, in that model's own FIM format (fim.fim_style), and uploads them to the
-    # private quark-data dataset. Models whose fills are already there are skipped.
-    # Then test them all in one go: GitHub > Actions > "Quark benchmark tests" > Run workflow, with the models
-    # comma-separated in the model box (the printout at the end gives the exact text).
+    # fill for the 600 benchmark holes of each prompt set it's listed with, in that model's own FIM format
+    # (fim.fim_style), and uploads them to the private quark-data dataset. Fills already there are skipped.
+    # Then test them: GitHub > Actions > "Quark benchmark tests" > Run workflow, one run per prompt set, with the
+    # models comma-separated in the model box (the printout at the end gives the exact text).
     # Paste the HF token, turn the GPU on (notebook specs button at the top), click Start.
     import marimo as mo
 
@@ -29,17 +29,20 @@ def _(mo, start, token):
     tok = token.value.strip()
     assert tok.startswith("hf_"), "Paste your Hugging Face token first"
 
-    MODELS = [
-        "neutronai-code/Quark-12B-A2.5B-v0.8-nes",  # next-edit training: tab completion must stay at v0.7's 59.8%
+    # (model, prompt sets). Prompt sets (bench/repo_holes_<set>.jsonl, make_ctx_bench.py): "ctx2" = the main
+    # benchmark (4k context); "ctx3" = 8k; "light" = the IDE's Light profile for slow machines (2k context, 1,600 /
+    # 600 chars around the hole); "fastlight" = Light with the short suffix the IDE gives Quark-1.5B (<=300 chars).
+    JOBS = [
+        ("neutronai-code/Quark-12B-A2.5B-v0.8-nes", ["ctx2"]),  # next-edit training: must stay at v0.7's 59.8%
+        ("neutronai-code/Quark-12B-A2.5B-v0.7", ["light"]),  # what the Light profile costs (v0.7 ctx2: 59.8%)
+        ("neutronai-code/Quark-1.5B-v0.5", ["light", "fastlight"]),  # the IDE's Fast model (ctx2: 52.2%)
     ]
     # Extra vLLM settings some models need. Codestral: read its Hugging Face files, not Mistral's own format (whose
     # tokenizer would treat "[SUFFIX]" in a raw prompt as plain text instead of the FIM token).
     EXTRA = {"mistralai/Codestral-22B-v0.1": ["--tokenizer-mode", "hf", "--config-format", "hf",
                                               "--load-format", "safetensors"]}
-    CTX = "ctx2"  # "ctx2" = the main benchmark (4k context); "ctx3" = 8k
     REDO_FILLS = False  # True: make new fills even if a model's are already uploaded
     DATASET = "neutronai-code/quark-data"
-    BENCH = f"bench/repo_holes_{CTX}.jsonl"
     work = os.path.abspath("quark_work")
     os.makedirs(work, exist_ok=True)
 
@@ -79,10 +82,13 @@ def _(mo, start, token):
     sys.path.insert(0, code)
     import fim
 
-    rows = [json.loads(l) for l in open(hf_hub_download(DATASET, BENCH, repo_type="dataset", token=tok,
-                                                        local_dir=work, force_download=True), encoding="utf-8")
-            if l.strip()]
-    print(f"{len(rows)} benchmark holes ({CTX})", flush=True)
+    holes = {}
+    for ctx in sorted({c for _, cs in JOBS for c in cs}):
+        holes[ctx] = [json.loads(l) for l in open(hf_hub_download(DATASET, f"bench/repo_holes_{ctx}.jsonl",
+                                                                  repo_type="dataset", token=tok, local_dir=work,
+                                                                  force_download=True), encoding="utf-8")
+                      if l.strip()]
+        print(f"{len(holes[ctx])} benchmark holes ({ctx})", flush=True)
 
     gpu = subprocess.run("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader", shell=True,
                          capture_output=True, text=True)
@@ -102,13 +108,16 @@ def _(mo, start, token):
         except RuntimeError as e:
             print("(kernel download skipped:", str(e).strip().splitlines()[-1][:200] + ")", flush=True)
 
-    def make_fills(model):
+    def make_fills(model, ctxs):
         sha = version(model)
         name = f"{model}@{sha[:7]}"
-        out = f"bench/fills_{name.split('/')[-1]}_{CTX}.json"
-        if not REDO_FILLS and exists(out):
-            print(f"\n== {name}: fills already uploaded, skipped", flush=True)
-            return name
+        outs = {ctx: f"bench/fills_{name.split('/')[-1]}_{ctx}.json" for ctx in ctxs}
+        todo = [ctx for ctx in ctxs if REDO_FILLS or not exists(outs[ctx])]
+        for ctx in ctxs:
+            if ctx not in todo:
+                print(f"\n== {name} ({ctx}): fills already uploaded, skipped", flush=True)
+        if not todo:
+            return
         style = fim.fim_style(model)
         print(f"\n== {name}: FIM format {style}", flush=True)
         subprocess.run("pkill -f 'vllm serve'", shell=True)
@@ -148,34 +157,39 @@ def _(mo, start, token):
                     print(f"{done[0]}/{len(rows)} fills", flush=True)
                 return x
 
-            print("sample fill:\n" + one(rows[0]["fim_prompt"])[:300] + "\n--- original:\n"
-                  + rows[0]["oracle_middle"][:300], flush=True)
-            done[0] = 0
-            t1 = time.time()
-            with ThreadPoolExecutor(32) as pool:
-                fills = list(pool.map(one, [r["fim_prompt"] for r in rows]))
+            for ctx in todo:
+                rows = holes[ctx]
+                print(f"-- {ctx}: sample fill:\n" + one(rows[0]["fim_prompt"])[:300] + "\n--- original:\n"
+                      + rows[0]["oracle_middle"][:300], flush=True)
+                done[0] = 0
+                t1 = time.time()
+                with ThreadPoolExecutor(32) as pool:
+                    fills = list(pool.map(one, [r["fim_prompt"] for r in rows]))
+                exact = sum(f.strip() == r["oracle_middle"].strip() for f, r in zip(fills, rows))
+                med = sorted(len(f) for f in fills)[len(fills) // 2]
+                print(f"{ctx}: {len(fills)} fills in {time.time() - t1:.0f}s: {exact} match the original exactly "
+                      f"(ctx2: Quark v0.7 183, Mellum2 base 165); median {med} chars (original code: ~98); "
+                      f"{sum(not f for f in fills)} empty", flush=True)
+                assert sum(not f for f in fills) < 0.5 * len(fills), "Most fills are empty: not uploading them"
+                api.upload_file(
+                    path_or_fileobj=json.dumps({"key": {"data": f"repo_holes_{ctx}.jsonl",
+                                                        "ids": [r["id"] for r in rows]},
+                                                "fills": {name: fills}}).encode("utf-8"),
+                    path_in_repo=outs[ctx], repo_id=DATASET, repo_type="dataset",
+                    commit_message=f"benchmark fills (vLLM, {ctx}): {name}")
+                print(f"Fills uploaded -> {DATASET}/{outs[ctx]}", flush=True)
         finally:
             try:
                 os.killpg(server.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-        exact = sum(f.strip() == r["oracle_middle"].strip() for f, r in zip(fills, rows))
-        med = sorted(len(f) for f in fills)[len(fills) // 2]
-        print(f"{len(fills)} fills in {time.time() - t1:.0f}s: {exact} match the original exactly (Quark v0.7: 183, "
-              f"Mellum2 base: 165); median {med} chars (original code: ~98); {sum(not f for f in fills)} empty",
-              flush=True)
-        api.upload_file(
-            path_or_fileobj=json.dumps({"key": {"data": f"repo_holes_{CTX}.jsonl", "ids": [r["id"] for r in rows]},
-                                        "fills": {name: fills}}).encode("utf-8"),
-            path_in_repo=out, repo_id=DATASET, repo_type="dataset", commit_message=f"benchmark fills (vLLM): {name}")
-        print(f"Fills uploaded -> {DATASET}/{out}", flush=True)
-        return name
 
-    done_models, failed = [], []
-    for m in MODELS:
+    ready, failed = {}, []
+    for m, ctxs in JOBS:
         try:
-            make_fills(m)
-            done_models.append(m)
+            make_fills(m, ctxs)
+            for ctx in ctxs:
+                ready.setdefault(ctx, []).append(m)
         except Exception as e:  # one model failing (e.g. a license not accepted) shouldn't stop the others
             print(f"!! {m} failed: {str(e)[-1500:]}", flush=True)
             failed.append(m)
@@ -183,9 +197,11 @@ def _(mo, start, token):
             time.sleep(5)
             shutil.rmtree(os.path.join(HF_HUB_CACHE, "models--" + m.replace("/", "--")), ignore_errors=True)
     print("\nDone." + (f" Failed: {', '.join(failed)}" if failed else ""), flush=True)
-    if done_models:
-        print("Next: GitHub > Actions > Quark benchmark tests > Run workflow, model box:\n" + ",".join(done_models)
-              + (f"\nctx: {CTX}" if CTX != "ctx2" else ""), flush=True)
+    if ready:
+        print("Next: GitHub > Actions > Quark benchmark tests > Run workflow, once per line (model box, ctx):",
+              flush=True)
+        for ctx, ms in ready.items():
+            print(f"  {','.join(ms)}   ctx: {ctx}", flush=True)
     return
 
 

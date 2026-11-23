@@ -92,7 +92,7 @@ def prep(a) -> list[str]:
         p = paths(a.ctx, name.split("/")[-1])
         saved = get(p["fills"], a.work, "fills_saved.json")
         if not saved:
-            maker = "molab_sample.py" if a.ctx == "pilot" else f"molab_fills.py with CTX = \"{a.ctx}\""
+            maker = "molab_sample.py" if a.ctx == "pilot" else f"molab_fills.py with \"{a.ctx}\" in JOBS"
             raise SystemExit(f"No fills uploaded yet for {name} ({p['fills']}): make them on molab's GPU first "
                              f"({maker} with \"{model}\" in MODELS)")
         data = json.load(open(saved, encoding="utf-8"))
@@ -172,7 +172,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("step", choices=["prep", "final"])
     ap.add_argument("--model", required=True)
-    ap.add_argument("--ctx", default="ctx2", choices=["ctx2", "ctx3", "pilot"])
+    ap.add_argument("--ctx", default="ctx2", choices=["ctx2", "ctx3", "light", "fastlight", "pilot"])
     ap.add_argument("--work", required=True)
     ap.add_argument("--parts", default="", help="final: folder with the repo jobs' progress.jsonl files")
     a = ap.parse_args()

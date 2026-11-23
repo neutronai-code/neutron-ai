@@ -7,6 +7,12 @@ tests), but each prompt first shows other code of the same repo as `<|file_sep|>
       around the cursor, members of the enclosing class, what the imports provide, an outline of the current file
       outside the window                                                                 -> repo_holes_ctx2.jsonl
 
+The IDE's lighter prompt profiles for slow machines: the same holes and tests with smaller budgets. --prefix-chars and
+--suffix-chars re-cut the hole's window at line boundaries, as repo_fim.window does with 2,400 / 900:
+  --budget 2000 --prefix-chars 1600 --suffix-chars 600 --out repo_holes_light.jsonl      (Quark-12B "Light")
+  --budget 2000 --prefix-chars 1600 --suffix-chars 301 --out repo_holes_fastlight.jsonl  (Quark-1.5B "Fast" + Light:
+      its prompt is prefix-first, so the IDE keeps the suffix to the rest of the line plus <=300 chars of whole lines)
+
 Neither ever sees the missing code. The other files come from the local clones (~/quark_repos, checked to be at the
 pinned commits). Same row ids, so a hole can be compared across prompt styles.
 
@@ -21,7 +27,20 @@ from pathlib import Path
 
 from ctx_gather import RepoContext
 from quark_data_v04 import context_block, git, import_graph, repo_files
-from repo_fim import REPOS
+from fim import format_qwen_fim_prompt
+from repo_fim import PREFIX_CHARS, REPOS, SUFFIX_CHARS
+
+
+def window(lines: list[str], lo: int, hi: int, prefix_chars: int, suffix_chars: int) -> tuple[str, str]:
+    """repo_fim.window with other sizes: up to prefix_chars before the hole and suffix_chars after it, line-cut."""
+    prefix = "".join(lines[:lo])
+    if len(prefix) > prefix_chars:
+        prefix = prefix[-prefix_chars:]
+        prefix = prefix[prefix.find("\n") + 1:]
+    suffix = "\n" + "".join(lines[hi:])
+    if len(suffix) > suffix_chars:
+        suffix = suffix[:suffix.rfind("\n", 0, suffix_chars) + 1]
+    return prefix, suffix
 
 
 def main():
@@ -30,6 +49,8 @@ def main():
     ap.add_argument("--holes", default="repo_holes.jsonl")
     ap.add_argument("--gatherer", choices=["imports", "names"], default="names")
     ap.add_argument("--budget", type=int, default=4000, help="context characters (names gatherer)")
+    ap.add_argument("--prefix-chars", type=int, default=PREFIX_CHARS, help="names gatherer: prompt chars before the hole")
+    ap.add_argument("--suffix-chars", type=int, default=SUFFIX_CHARS, help="names gatherer: prompt chars after the hole")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
     out = a.out or {"imports": "repo_holes_ctx.jsonl", "names": "repo_holes_ctx2.jsonl"}[a.gatherer]
@@ -65,6 +86,10 @@ def main():
                 editor = before + after  # the file with the hole's lines missing: what the editor has
                 cur = len(before)
                 assert editor[cur - len(r["prefix"]):cur] == r["prefix"].replace("\r\n", "\n"), r["id"]
+                if (a.prefix_chars, a.suffix_chars) != (PREFIX_CHARS, SUFFIX_CHARS):  # a smaller window: re-cut
+                    prefix, suffix = window(lines, r["lo"], r["hi"], a.prefix_chars, a.suffix_chars)
+                    assert r["prefix"].replace("\r\n", "\n").endswith(prefix), r["id"]
+                    r = {**r, "prefix": prefix, "suffix": suffix, "fim_prompt": format_qwen_fim_prompt(prefix, suffix)}
                 ctx = rc.gather(r["path"], editor, cur - len(r["prefix"]), cur + len(r["suffix"]), cur, a.budget)
             else:
                 files, graph, callers = repos[r["repo"]]
