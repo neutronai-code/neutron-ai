@@ -78,7 +78,9 @@ def _(mo, start, token):
 
     # llama.cpp: the source (for the converter) and the prebuilt CUDA binaries (llama-quantize, llama-server)
     llama = os.path.join(work, "llama.cpp")
-    if not os.path.exists(os.path.join(llama, "src", "convert_hf_to_gguf.py")):
+    have_bins = all(glob.glob(os.path.join(llama, "bin_x", "**", b), recursive=True)
+                    for b in ("llama-quantize", "llama-server"))
+    if not (have_bins and os.path.exists(os.path.join(llama, "src", "convert_hf_to_gguf.py"))):  # else: (re)download
         shutil.rmtree(llama, ignore_errors=True)
         os.makedirs(os.path.join(llama, "bin"))
         rel = f"https://github.com/ggml-org/llama.cpp/releases/download/{LLAMA}"

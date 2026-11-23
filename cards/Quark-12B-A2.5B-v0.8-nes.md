@@ -74,6 +74,9 @@ prompt includes about 4k characters of repository context. Every model gets the 
   wins 20 holes and loses 15, which is within noise. A third of its training examples were tab-completion examples,
   replayed so it would keep that skill.
 - It stays level with Qwen2.5-Coder-14B, a dense model with about six times the compute per token.
+- **The GGUF keeps both skills.** The Q4_K_M [GGUF](https://huggingface.co/neutronai-code/Quark-12B-A2.5B-v0.8-nes-GGUF)
+  (8.1 GB) passes 59.2% here (15 wins / 24 losses against these weights, within noise) and scores 46.6% overall /
+  28.5% exact on next edits.
 
 ## Prompt format: tab completion
 
