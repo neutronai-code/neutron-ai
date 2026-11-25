@@ -771,7 +771,8 @@ def _build_cpp_harness(test_code: str, undef_names: list[str] | tuple[str, ...] 
     return "\n".join([*_CPP_STD_HEADERS, *includes]), main_src, assert_count
 
 
-def _verify_sql(solution_text: str, test_code: str, starter_code: str, files: dict[str, str] | None) -> tuple[float, dict]:
+def _verify_sql(solution_text: str, test_code: str, starter_code: str, files: dict[str, str] | None,
+                timeout: float = 4.0) -> tuple[float, dict]:
     """In-memory SQLite3 execution verifier (zero subprocess overhead, <1ms, supports single queries & schema migrations!).
     `starter_code` holds initial DDL/seed SQL; `test_code` is Python assertions against `conn` and `rows`."""
     t0 = time.perf_counter()
@@ -794,6 +795,10 @@ def _verify_sql(solution_text: str, test_code: str, starter_code: str, files: di
     conn.set_authorizer(
         lambda action, *_a: sqlite3.SQLITE_DENY if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_READ and 0) else sqlite3.SQLITE_OK
     )
+    # Runs in-process, so nothing else can stop it: abort any statement once the time is up (an endless recursive
+    # CTE otherwise hangs the whole scorer or GRPO run). SQLite then raises OperationalError("interrupted").
+    deadline = time.perf_counter() + max(timeout, 1.0)
+    conn.set_progress_handler(lambda: time.perf_counter() > deadline, 10_000)
     try:
         if starter_code:
             conn.executescript(starter_code)
@@ -807,6 +812,8 @@ def _verify_sql(solution_text: str, test_code: str, starter_code: str, files: di
             rows = []
     except sqlite3.Error as e:
         conn.close()
+        if time.perf_counter() > deadline:
+            return 0.0, {"status": "timeout", "passed": 0, "total": 1, "ms": round(max(timeout, 1.0) * 1000, 1)}
         return 0.0, {"status": f"sql_error: {e}", "passed": 0, "total": 1, "ms": round((time.perf_counter() - t0) * 1000, 2)}
 
     # Evaluate top-level Python assertions against `conn` and `rows` for dense partial credit!
@@ -1006,7 +1013,7 @@ def _verify_uncached(
     timeout: float,
 ) -> tuple[float, dict]:
     if lang in ("sql", "sqlite"):
-        return _verify_sql(solution_text, test_code, starter_code, files)
+        return _verify_sql(solution_text, test_code, starter_code, files, timeout)
     if lang in ("python_stdio", "stdio"):
         return _verify_stdio(solution_text, test_code, timeout)
 
