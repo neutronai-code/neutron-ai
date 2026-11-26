@@ -1,0 +1,50 @@
+# Hadron: score bake-off answers with the real tests (hadron_score.py's default --set bench).
+# First generate and upload the answers on molab (molab_hadron_bench.py, "Bake-off"). Then run this workflow:
+# Actions > "Hadron bake-off scoring" > Run workflow. It reads gen/<TAG>/tasks_holdout.json and tasks.json from
+# hadron-data and writes eval/<TAG>/ reports. Needs the repository secret HF_TOKEN (write access to hadron-data).
+name: Hadron bake-off scoring
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: "Space-separated model tags under gen/ (baseline first for the comparison table)"
+        required: true
+        default: "Mellum2.1-12B-A2.5B-Thinking-32k Hadron-Mellum2.1-12B-A2.5B-sft1-32k"
+      redo:
+        description: "Score again even if eval/<TAG>/ already has a report"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hadron-bench-score
+  cancel-in-progress: false
+
+env:
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  TAGS: ${{ inputs.tags }}
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  score:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4  # JS/TS tests need Node 22.7+ (type stripping); ubuntu-24.04 has g++ 13 for C++23
+        with:
+          node-version: "24"
+      - run: pip install -q huggingface_hub
+      - name: Test the bake-off answers and print the comparison
+        run: |
+          if [ "${{ inputs.redo }}" = "true" ]; then
+            python -u hadron_score.py $TAGS --workers 4 --redo
+          else
+            python -u hadron_score.py $TAGS --workers 4
+          fi
