@@ -421,7 +421,7 @@ def main():
                          "models (Quark 1.5B needs ~20GB VRAM + activations)")
     ap.add_argument("--batch-size", type=int, default=4, help="fim-sft: rows per GPU micro-batch")
     ap.add_argument("--plain-hf", action="store_true",
-                    help="fim-sft LoRA with plain transformers + PEFT instead of Unsloth (automatic for "
+                    help="fim-sft/sft LoRA with plain transformers + PEFT instead of Unsloth (automatic for "
                          "architectures in PLAIN_HF_TYPES, e.g. JetBrains Mellum2)")
     ap.add_argument("--grad-accum", type=int, default=4, help="fim-sft: micro-batches per optimizer step")
     ap.add_argument("--fim-style", choices=["auto", "qwen-spm"], default="auto",
@@ -438,8 +438,8 @@ def main():
     plain = args.plain_hf or hf_model_type(args.model) in PLAIN_HF_TYPES
     resume_from = _find_resume_checkpoint(args.out, args.push_hf) if args.resume else None
     if plain:
-        if args.mode != "fim-sft":
-            sys.exit("[NeutronAI] the plain transformers path is wired up for fim-sft only.")
+        if args.mode not in ("fim-sft", "sft"):
+            sys.exit("[NeutronAI] the plain transformers path is wired up for fim-sft and sft only.")
         model, tokenizer = (load_plain_full(args.model, resume_from) if args.full_finetune
                             else load_plain_lora(args.model))
         is_bfloat16_supported = torch.cuda.is_bf16_supported
