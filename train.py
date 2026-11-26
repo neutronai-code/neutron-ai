@@ -563,7 +563,7 @@ def main():
                 gradient_accumulation_steps=4,
                 learning_rate=2e-4,
                 lr_scheduler_type="cosine",
-                warmup_ratio=0.1,
+                warmup_steps=max(1, args.steps // 10),  # 10% (transformers 5 dropped warmup_ratio)
                 max_steps=args.steps,
                 logging_steps=1,
                 save_steps=save_steps,
