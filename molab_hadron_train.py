@@ -16,7 +16,7 @@ def _():
     import marimo as mo
 
     token = mo.ui.text(kind="password", label="Hugging Face token (hf_...)", full_width=True)
-    data_file = mo.ui.file(label="Training data: sft_distill_mellum_clean.jsonl", filetypes=[".jsonl"], kind="button")
+    data_file = mo.ui.file(label="Training data: sft_hadron_mix_clean.jsonl", filetypes=[".jsonl"], kind="button")
     code_file = mo.ui.file(label="Updated train.py (optional once the SFT change is on GitHub main)",
                            filetypes=[".py"], kind="button")
     start = mo.ui.run_button(label="Start training")
@@ -42,11 +42,12 @@ def _(mo, start, token, data_file, code_file):
     mo.stop(not start.value, mo.md("Paste your HF token, upload the clean JSONL and updated `train.py`, then click Start."))
     assert token.value.strip().startswith("hf_"), "Paste your Hugging Face token first"
     assert torch.cuda.is_available(), "No GPU: turn it on with the notebook specs button at the top, then rerun"
-    assert data_file.value, "Upload sft_distill_mellum_clean.jsonl first"
+    assert data_file.value, "Upload the SFT JSONL first"
 
     MODEL = "JetBrains/Mellum2.1-12B-A2.5B-Thinking"
-    REPO = "neutronai-code/Hadron-Mellum2.1-12B-A2.5B-sft1"  # merged model + checkpoints; smoke uploads nothing
-    EPOCHS = 2
+    REPO = "neutronai-code/Hadron-Mellum2.1-12B-A2.5B-sft2"  # merged model + checkpoints; smoke uploads nothing
+    EPOCHS = 1
+    LR = "5e-5"  # gentler than sft1's two epochs at 2e-4, which collapsed the base's reasoning
     SMOKE = True  # run this first; after it passes, set False and rerun for the real adapter
     MAX_MIN = 180  # wall-clock guard for the full run, in minutes
     work = os.path.abspath("hadron_sft_work")
@@ -56,10 +57,10 @@ def _(mo, start, token, data_file, code_file):
     rows = [json.loads(line) for line in raw.decode("utf-8").splitlines() if line.strip()]
     assert rows and all(isinstance(r.get("messages"), list) for r in rows), "This is not an SFT messages JSONL"
     steps = math.ceil(len(rows) * EPOCHS / 8)  # train.py SFT: micro-batch 2 x gradient accumulation 4
-    data = os.path.join(work, "sft_distill_mellum_clean.jsonl")
+    data = os.path.join(work, "sft_hadron_mix_clean.jsonl")
     with open(data, "wb") as f:
         f.write(raw)
-    print(f"{len(rows)} SFT rows | {EPOCHS} epochs = {steps} optimizer steps", flush=True)
+    print(f"{len(rows)} SFT rows | {EPOCHS} epoch(s) = {steps} optimizer steps | lr={LR}", flush=True)
     print("torch", torch.__version__, "|", torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0), flush=True)
 
     # 1. The versions pinned by uv.lock. TRL is required for train.py --mode sft (Quark FIM doesn't need it).
@@ -92,7 +93,7 @@ def _(mo, start, token, data_file, code_file):
         args = [sys.executable, "-u", "train.py", "--mode", "sft", "--model", MODEL,
                 "--data", data, "--steps", str(n_steps), "--max-minutes", str(max_min),
                 "--max-seq-len", "3072", "--load-in-4bit", "no", "--out", out, "--resume",
-                "--save-steps", str(save_steps), *(["--push-hf", push] if push else [])]
+                "--save-steps", str(save_steps), "--lr", LR, *(["--push-hf", push] if push else [])]
         bar = re.compile(rf"\d+/{n_steps} \[")
         proc = subprocess.Popen(args, cwd=code, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         last_bar, buf = 0.0, b""
@@ -130,7 +131,7 @@ def _(mo, start, token, data_file, code_file):
         print("\nSmoke test passed: set SMOKE = False and run again for the real adapter." if ok else
               "\nSmoke test FAILED: see the error above.", flush=True)
     else:
-        train(steps, os.path.join(work, "run"), REPO, 25, MAX_MIN)
+        train(steps, os.path.join(work, "run"), REPO, max(1, steps // 2), MAX_MIN)
 
 
 if __name__ == "__main__":

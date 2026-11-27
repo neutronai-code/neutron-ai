@@ -24,6 +24,7 @@ def _():
         "Qwen3.5-4B (today's Hadron base: the baseline)": ("Qwen/Qwen3.5-4B", 0, 20, []),
         "Mellum2.1-12B-A2.5B-Thinking (JetBrains)": ("JetBrains/Mellum2.1-12B-A2.5B-Thinking", 0, 36, []),
         "Hadron Mellum2.1 SFT pilot (merged)": ("neutronai-code/Hadron-Mellum2.1-12B-A2.5B-sft1", 0, 36, []),
+        "Hadron Mellum2.1 SFT2 native mix (merged)": ("neutronai-code/Hadron-Mellum2.1-12B-A2.5B-sft2", 0, 36, []),
         "Qwen3.5-9B": ("Qwen/Qwen3.5-9B", 0, 32, []),
         "Granite 4.2 8B (IBM)": ("ibm-granite/granite-4.2-8b", 0, 40, []),
         "Qwen3.6-35B-A3B (big)": ("Qwen/Qwen3.6-35B-A3B", 0, 84, ["--language-model-only"]),
@@ -32,6 +33,7 @@ def _():
     }
     TASK_SETS = {
         "Bake-off: 236 held-out + 26 hand-made tasks": "bench",
+        "Native SFT harvest: 800 solvable tasks, 1 answer each (keeps reasoning)": "harvest",
         "Training tasks: all 2,871 others (pass rates for RL and distillation; ~4-6 h per model)": "train",
     }
     token = mo.ui.text(kind="password", label="Hugging Face token (hf_...)", full_width=True)
@@ -56,10 +58,12 @@ def _(MODELS, TASK_SETS, choice, mo, start, taskset, token):
     BASE, BASE_REV = "Qwen/Qwen3.5-4B", "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"  # the base Hadron was trained on
     DATASET = "neutronai-code/hadron-data"
     CTX = 32768  # tokens per request (prompt + thinking + answer), the same for every model
-    N, TEMP = 4, 0.6  # answers per task and their temperature, as in modal_eval.py
     TRAIN = TASK_SETS[taskset.value] == "train"
+    HARVEST = TASK_SETS[taskset.value] == "harvest"
+    N = 1 if HARVEST else 4
+    TEMP = 0.6  # answers per task and their temperature, as in modal_eval.py
     PART = 250  # training tasks are answered and uploaded in parts of this many (a crash loses at most one part)
-    CONC = 128 if TRAIN else 64  # requests at once (= vLLM's --max-num-seqs); results don't depend on it
+    CONC = 128 if (TRAIN or HARVEST) else 64  # requests at once (= vLLM's --max-num-seqs); results don't depend on it
 
     from huggingface_hub import HfApi, hf_hub_download, snapshot_download
     from huggingface_hub.constants import HF_HUB_CACHE
@@ -131,7 +135,18 @@ def _(MODELS, TASK_SETS, choice, mo, start, taskset, token):
 
     # Each "file" is one upload: gen/<TAG>/<file>.json. Bake-off: tasks_holdout + tasks. Training: every generated task
     # that isn't held out, in file order, as train/part-000, train/part-001, ... (hadron_score.py --set train reads them).
-    if TRAIN:
+    if HARVEST:
+        # One native answer per task, keeping reasoning_content for SFT. Prefer tasks the base answers reliably, so most
+        # of the harvest is usable; build_sft_mix.py still re-verifies every answer before keeping it.
+        rates_path = hf_hub_download(DATASET, "rates/Mellum2.1-12B-A2.5B-Thinking-32k.jsonl", repo_type="dataset",
+                                     token=tok, local_dir=work)
+        rates = {r["id"]: r["rate"] for r in map(json.loads, open(rates_path, encoding="utf-8"))}
+        held_out = {t["id"] for t in load("tasks_holdout.jsonl")}
+        pool_ = [t for t in load("tasks_generated.jsonl") if t["id"] not in held_out and rates.get(t["id"], 0) > 0]
+        pool_.sort(key=lambda t: (-rates[t["id"]], t["id"]))
+        tasks = {"train/harvest-000": pool_[:800]}
+        log(f"native SFT harvest: {len(tasks['train/harvest-000'])} tasks, one answer each")
+    elif TRAIN:
         held_out = {t["id"] for t in load("tasks_holdout.jsonl")}
         pool_ = [t for t in load("tasks_generated.jsonl") if t["id"] not in held_out]
         tasks = {f"train/part-{i // PART:03d}": pool_[i:i + PART] for i in range(0, len(pool_), PART)}
@@ -308,8 +323,12 @@ def _(MODELS, TASK_SETS, choice, mo, start, taskset, token):
                     with urllib.request.urlopen(req, timeout=1800) as r:
                         out = json.loads(r.read().decode("utf-8"))
                     c = out["choices"][0]
-                    return [c["message"].get("content") or "", c.get("finish_reason"),
-                            (out.get("usage") or {}).get("completion_tokens", 0)]
+                    msg = c["message"]
+                    content = msg.get("content") or ""
+                    reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+                    if reasoning and "</think>" not in content:
+                        content = f"<think>\n{reasoning.strip()}\n</think>\n\n{content.strip()}"
+                    return [content, c.get("finish_reason"), (out.get("usage") or {}).get("completion_tokens", 0)]
                 except urllib.error.HTTPError as e:
                     if e.code == 400:  # e.g. the prompt is longer than the context: the same every time, don't retry
                         return ["", f"rejected: {e.read().decode('utf-8', 'replace')[:200]}", 0]

@@ -2,4 +2,5 @@
 tasks_deepcoder.jsonl
 __pycache__/
 inbox/
+.native_cache/
 cases_rejected.jsonl

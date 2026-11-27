@@ -396,7 +396,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["sft", "fim-sft", "dpo", "grpo", "fim-grpo", "repo-grpo"], default="grpo")
     ap.add_argument("--holes-per-step", type=int, default=4, help="repo-grpo: holes per optimizer step")
-    ap.add_argument("--lr", type=float, default=0.0, help="Learning rate override (fim-sft default 1e-4)")
+    ap.add_argument("--lr", type=float, default=0.0, help="Learning rate override (fim-sft default 1e-4; sft default 2e-4)")
     ap.add_argument("--model", default="Qwen/Qwen2.5-Coder-1.5B-Instruct")
     ap.add_argument("--data", default="tasks.jsonl")
     ap.add_argument("--steps", type=int, default=50)
@@ -561,7 +561,7 @@ def main():
                 max_length=args.max_seq_len,
                 per_device_train_batch_size=2,
                 gradient_accumulation_steps=4,
-                learning_rate=2e-4,
+                learning_rate=args.lr or 2e-4,
                 lr_scheduler_type="cosine",
                 warmup_steps=max(1, args.steps // 10),  # 10% (transformers 5 dropped warmup_ratio)
                 max_steps=args.steps,
