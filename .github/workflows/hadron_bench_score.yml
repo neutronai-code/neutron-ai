@@ -10,7 +10,7 @@ on:
       tags:
         description: "Space-separated model tags under gen/ (baseline first for the comparison table)"
         required: true
-        default: "Mellum2.1-12B-A2.5B-Thinking-32k Hadron-Mellum2.1-12B-A2.5B-sft1-32k"
+        default: "Mellum2.1-12B-A2.5B-Thinking-32k Hadron-Mellum2.1-12B-A2.5B-sft2-32k"
       redo:
         description: "Score again even if eval/<TAG>/ already has a report"
         type: boolean
