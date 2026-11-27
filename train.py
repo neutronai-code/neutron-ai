@@ -726,6 +726,11 @@ def main():
               + (f" on {args.push_hf}/last-checkpoint" if args.push_hf else "")
               + ". Run again with --resume to continue.", flush=True)
         return
+    if plain:
+        # Training asks MoE models for router logits (aux loss). At inference that makes Transformers install an
+        # output-capturing hook whose lock TorchDynamo/vLLM cannot compile. Restore normal inference settings.
+        model.config.output_router_logits = False
+        model.config.use_cache = True
     if not (plain and args.full_finetune):  # a plain full fine-tune is uploaded straight from memory
         model.save_pretrained(args.out)
         tokenizer.save_pretrained(args.out)
